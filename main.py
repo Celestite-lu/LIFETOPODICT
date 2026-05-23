@@ -78,6 +78,13 @@ def main():
         'class_score_norm_strength', 'class_score_norm_min_scale',
         'use_node_density_scoring', 'node_density_scoring_strength',
         'node_density_scoring_mode', 'node_density_scoring_clip',
+        'use_topology_reliability_arbitration',
+        'topology_reliability_margin_cap',
+        'topology_reliability_min_gap',
+        'topology_reliability_penalty',
+        'topology_reliability_count_weight',
+        'topology_reliability_residual_weight',
+        'topology_reliability_mode',
         'use_feature_cache', 'feature_cache_dir', 'feature_cache_strict',
         'feature_cache_dtype', 'feature_cache_skip_backbone',
         'feature_cache_classifier_device',
@@ -298,6 +305,20 @@ def setup_parser():
                         help='Node density mode: log_count, sqrt, or random_control.')
     parser.add_argument('--node_density_scoring_clip', type=float, default=None,
                         help='Absolute clipping bound for node-density adjustment before scaling.')
+    parser.add_argument('--use_topology_reliability_arbitration', type=_str2bool, default=None,
+                        help='Arbitrate low-margin compact top1/top2 decisions using node support/residual reliability.')
+    parser.add_argument('--topology_reliability_margin_cap', type=float, default=None,
+                        help='Only apply topology reliability arbitration below this compact top1/top2 margin.')
+    parser.add_argument('--topology_reliability_min_gap', type=float, default=None,
+                        help='Minimum top2-minus-top1 reliability gap required for arbitration.')
+    parser.add_argument('--topology_reliability_penalty', type=float, default=None,
+                        help='Fixed distance penalty added to compact top1 when topology arbitration fires.')
+    parser.add_argument('--topology_reliability_count_weight', type=float, default=None,
+                        help='Weight for log-support difference in topology reliability gap.')
+    parser.add_argument('--topology_reliability_residual_weight', type=float, default=None,
+                        help='Weight for residual advantage in topology reliability gap.')
+    parser.add_argument('--topology_reliability_mode', type=str, default=None,
+                        help='Topology reliability mode: count_residual, count_only, residual_only, inverse, or random_control.')
 
     # --- Direction 2: ATD-aware atom conflict gate ---
     parser.add_argument('--use_atom_conflict_gate', type=_str2bool, default=None,

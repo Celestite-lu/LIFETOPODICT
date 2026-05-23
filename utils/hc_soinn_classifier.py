@@ -457,6 +457,14 @@ class HCSOINNClassifier:
         node_density_scoring_strength: float = 0.0,
         node_density_scoring_mode: str = "log_count",
         node_density_scoring_clip: float = 2.0,
+        # --- Low-margin topology reliability arbitration ---
+        use_topology_reliability_arbitration: bool = False,
+        topology_reliability_margin_cap: float = 0.02,
+        topology_reliability_min_gap: float = 0.5,
+        topology_reliability_penalty: float = 0.03,
+        topology_reliability_count_weight: float = 1.0,
+        topology_reliability_residual_weight: float = 2.0,
+        topology_reliability_mode: str = "count_residual",
     ) -> None:
         self.max_prototypes_per_class = None if max_prototypes_per_class is None else int(
             max_prototypes_per_class
@@ -700,6 +708,31 @@ class HCSOINNClassifier:
         self.node_density_scoring_strength: float = float(node_density_scoring_strength)
         self.node_density_scoring_mode: str = str(node_density_scoring_mode).lower()
         self.node_density_scoring_clip: float = max(0.0, float(node_density_scoring_clip))
+
+        # ------------------------------------------------------------------ #
+        # Low-margin topology reliability arbitration. Uses existing node
+        # support counts and dictionary residuals to arbitrate compact top1 vs
+        # compact top2 only when the score margin is small.
+        # ------------------------------------------------------------------ #
+        self.use_topology_reliability_arbitration: bool = bool(
+            use_topology_reliability_arbitration
+        )
+        self.topology_reliability_margin_cap: float = max(
+            0.0, float(topology_reliability_margin_cap)
+        )
+        self.topology_reliability_min_gap: float = float(topology_reliability_min_gap)
+        self.topology_reliability_penalty: float = max(
+            0.0, float(topology_reliability_penalty)
+        )
+        self.topology_reliability_count_weight: float = float(
+            topology_reliability_count_weight
+        )
+        self.topology_reliability_residual_weight: float = float(
+            topology_reliability_residual_weight
+        )
+        self.topology_reliability_mode: str = str(topology_reliability_mode).lower()
+        self._topology_reliability_eval_stats: Dict[str, float] = {}
+        self.reset_topology_reliability_eval_stats()
 
         # ------------------------------------------------------------------ #
         # LifeTopoDict: shared dictionary atoms and metadata
@@ -1027,6 +1060,47 @@ class HCSOINNClassifier:
             values = torch.clamp(values, min=-clip, max=clip)
         return values * strength
 
+    def _topology_reliability_gap_numpy(
+        self,
+        top1_count: np.ndarray,
+        top1_residual: np.ndarray,
+        top2_count: np.ndarray,
+        top2_residual: np.ndarray,
+        top1_classes: np.ndarray,
+        top2_classes: np.ndarray,
+    ) -> np.ndarray:
+        """Compute top2-minus-top1 local topology reliability gap."""
+        mode = str(getattr(self, "topology_reliability_mode", "count_residual")).lower()
+        top1_count = np.asarray(top1_count, dtype=np.float32)
+        top2_count = np.asarray(top2_count, dtype=np.float32)
+        top1_residual = np.asarray(top1_residual, dtype=np.float32)
+        top2_residual = np.asarray(top2_residual, dtype=np.float32)
+
+        count_gap = np.log1p(np.maximum(top2_count, 0.0)) - np.log1p(
+            np.maximum(top1_count, 0.0)
+        )
+        residual_gap = top1_residual - top2_residual
+        if mode in ("count", "count_only", "support"):
+            score = count_gap
+        elif mode in ("residual", "residual_only"):
+            score = residual_gap
+        elif mode in ("inverse", "reverse"):
+            score = -(
+                float(getattr(self, "topology_reliability_count_weight", 1.0)) * count_gap
+                + float(getattr(self, "topology_reliability_residual_weight", 2.0)) * residual_gap
+            )
+        elif mode in ("random", "random_control"):
+            vals = np.zeros_like(count_gap, dtype=np.float32)
+            for idx, (first_cls, second_cls) in enumerate(zip(top1_classes, top2_classes)):
+                vals[idx] = self._stable_pair_unit_score(int(first_cls), int(second_cls)) - 0.5
+            score = vals
+        else:
+            score = (
+                float(getattr(self, "topology_reliability_count_weight", 1.0)) * count_gap
+                + float(getattr(self, "topology_reliability_residual_weight", 2.0)) * residual_gap
+            )
+        return np.asarray(score, dtype=np.float32)
+
     # ================================================================== #
     # Direction 1: raw-node fallback cache and prediction trace           #
     # ================================================================== #
@@ -1089,6 +1163,20 @@ class HCSOINNClassifier:
     def reset_pair_margin_eval_stats(self) -> None:
         """Reset per-evaluation pair-margin calibration accumulators."""
         self._pair_margin_eval_stats = {
+            "samples": 0.0,
+            "gate_used": 0.0,
+            "prediction_changed": 0.0,
+            "score_sum": 0.0,
+            "penalty_sum": 0.0,
+            "compact_correct": 0.0,
+            "final_correct": 0.0,
+            "benefit_selected": 0.0,
+            "harm_selected": 0.0,
+        }
+
+    def reset_topology_reliability_eval_stats(self) -> None:
+        """Reset per-evaluation topology reliability arbitration accumulators."""
+        self._topology_reliability_eval_stats = {
             "samples": 0.0,
             "gate_used": 0.0,
             "prediction_changed": 0.0,
@@ -1506,6 +1594,17 @@ class HCSOINNClassifier:
             total_bytes += 8.0 * 3.0
         return {
             "node_density_scoring_model_bytes": total_bytes,
+        }
+
+    def _topology_reliability_model_bytes(self) -> Dict[str, float]:
+        """Return storage bytes for topology reliability arbitration scalars."""
+        total_bytes = 0.0
+        if bool(getattr(self, "use_topology_reliability_arbitration", False)):
+            # enable flag/mode id plus margin, gap, penalty and two weights.
+            # Node counts/residuals are already part of node metadata.
+            total_bytes += 8.0 * 6.0
+        return {
+            "topology_reliability_model_bytes": total_bytes,
         }
 
     def _compute_atom_sharedness(self) -> Dict[int, float]:
@@ -4249,6 +4348,11 @@ class HCSOINNClassifier:
             node_density_storage.get('node_density_scoring_model_bytes', 0.0)
         )
         breakdown.update(node_density_storage)
+        topology_reliability_storage = self._topology_reliability_model_bytes()
+        topology_reliability_model_bytes = float(
+            topology_reliability_storage.get('topology_reliability_model_bytes', 0.0)
+        )
+        breakdown.update(topology_reliability_storage)
 
         if self.use_dict_coding and atom_deployable_bytes > 0.0:
             # Deployable LifeTopoDict storage keeps one atom matrix, sparse
@@ -4282,6 +4386,7 @@ class HCSOINNClassifier:
         compact += raw_auxiliary_model_bytes
         compact += class_score_normalization_model_bytes
         compact += node_density_scoring_model_bytes
+        compact += topology_reliability_model_bytes
         breakdown['compact_deployable_bytes'] = compact
 
         # --- Caches (inference predict cache) ---
@@ -4345,6 +4450,7 @@ class HCSOINNClassifier:
             raw_auxiliary_model_bytes +
             class_score_normalization_model_bytes +
             node_density_scoring_model_bytes +
+            topology_reliability_model_bytes +
             cache_bytes +
             buffers_bytes +
             frozen_bytes +
@@ -4416,6 +4522,9 @@ class HCSOINNClassifier:
         atom_eval_stats = dict(getattr(self, '_atom_conflict_eval_stats', {}))
         pair_margin_stats = dict(getattr(self, '_pair_margin_fit_stats', {}))
         pair_margin_eval_stats = dict(getattr(self, '_pair_margin_eval_stats', {}))
+        topology_reliability_eval_stats = dict(
+            getattr(self, '_topology_reliability_eval_stats', {})
+        )
         class_score_norm_stats = dict(getattr(self, '_class_score_norm_fit_stats', {}))
         node_residual_repair_stats = self._summarize_node_residual_repair_stats()
         if atom_gate_stats:
@@ -4439,6 +4548,43 @@ class HCSOINNClassifier:
                     'eval_final_accuracy': float(pair_margin_eval_stats.get('final_correct', 0.0)) / samples_eval,
                     'eval_benefit_selected': float(pair_margin_eval_stats.get('benefit_selected', 0.0)),
                     'eval_harm_selected': float(pair_margin_eval_stats.get('harm_selected', 0.0)),
+                })
+        topology_reliability_stats: Dict[str, object] = {}
+        if bool(getattr(self, "use_topology_reliability_arbitration", False)):
+            samples_eval = float(topology_reliability_eval_stats.get('samples', 0.0))
+            topology_reliability_stats = {
+                'enabled': 1.0,
+                'mode': str(getattr(self, "topology_reliability_mode", "")),
+                'margin_cap': float(getattr(self, "topology_reliability_margin_cap", 0.0)),
+                'min_gap': float(getattr(self, "topology_reliability_min_gap", 0.0)),
+                'penalty': float(getattr(self, "topology_reliability_penalty", 0.0)),
+                'count_weight': float(getattr(self, "topology_reliability_count_weight", 0.0)),
+                'residual_weight': float(getattr(self, "topology_reliability_residual_weight", 0.0)),
+            }
+            if samples_eval > 0.0:
+                topology_reliability_stats.update({
+                    'eval_gate_rate': (
+                        float(topology_reliability_eval_stats.get('gate_used', 0.0))
+                        / samples_eval
+                    ),
+                    'eval_change_rate': (
+                        float(topology_reliability_eval_stats.get('prediction_changed', 0.0))
+                        / samples_eval
+                    ),
+                    'eval_compact_accuracy': (
+                        float(topology_reliability_eval_stats.get('compact_correct', 0.0))
+                        / samples_eval
+                    ),
+                    'eval_final_accuracy': (
+                        float(topology_reliability_eval_stats.get('final_correct', 0.0))
+                        / samples_eval
+                    ),
+                    'eval_benefit_selected': float(
+                        topology_reliability_eval_stats.get('benefit_selected', 0.0)
+                    ),
+                    'eval_harm_selected': float(
+                        topology_reliability_eval_stats.get('harm_selected', 0.0)
+                    ),
                 })
         self._last_fallback_stats = fallback_stats
         inactive_node_ratio = float(lifecycle_summary.get('inactive_node_ratio', 0.0))
@@ -4468,6 +4614,7 @@ class HCSOINNClassifier:
             'raw_fallback_gate_stats': fallback_gate_stats,
             'atom_conflict_gate_stats': atom_gate_stats,
             'pair_margin_stats': pair_margin_stats,
+            'topology_reliability_stats': topology_reliability_stats,
             'class_score_normalization_stats': class_score_norm_stats,
             'node_residual_repair_stats': node_residual_repair_stats,
         }
@@ -5870,6 +6017,7 @@ class HCSOINNClassifier:
             or getattr(self, 'use_raw_fallback_gate', False)
             or getattr(self, 'use_atom_conflict_gate', False)
             or getattr(self, 'use_pair_margin_calibration', False)
+            or getattr(self, 'use_topology_reliability_arbitration', False)
             or getattr(self, 'use_raw_auxiliary_nodes', False)
         )
         valid_classes_np = np.array(valid_classes, dtype=np.int64)
@@ -5991,6 +6139,27 @@ class HCSOINNClassifier:
                                 selected_atom_abs_sum_np[row] = float(weight_sum)
                                 selected_atom_entropy_np[row] = float(-np.sum(probs * np.log(probs + 1e-12)))
 
+            runner_node_np = np.full(N, -1, dtype=np.int64)
+            runner_count_np = np.zeros(N, dtype=np.float32)
+            runner_residual_np = np.zeros(N, dtype=np.float32)
+            runner_distance_np = np.full(N, np.nan, dtype=np.float32)
+            runner_state_np = np.array(["unknown"] * N, dtype=object)
+            for row, class_index in enumerate(compact_top2_idx_np):
+                positions = proto_positions_by_class.get(int(class_index))
+                if positions is None or positions.size == 0:
+                    continue
+                local_offset = int(np.argmin(dist_proto_np[row, positions]))
+                proto_pos = int(positions[local_offset])
+                node_idx = int(proto_node_index_np[proto_pos])
+                cls = int(valid_classes[int(class_index)])
+                runner_node_np[row] = node_idx
+                runner_distance_np[row] = float(dist_proto_np[row, proto_pos])
+                if node_idx >= 0 and node_idx < len(self.class_clusters.get(cls, [])):
+                    node = self.class_clusters[cls][node_idx]
+                    runner_count_np[row] = float(getattr(node, "count", 0.0))
+                    runner_residual_np[row] = float(getattr(node, "residual", 0.0))
+                    runner_state_np[row] = str(getattr(node, "node_state", "plastic"))
+
             atom_conflict_score_np = np.zeros(N, dtype=np.float32)
             atom_conflict_penalty_np = np.zeros(N, dtype=np.float32)
             atom_conflict_gate_np = np.zeros(N, dtype=bool)
@@ -6030,6 +6199,39 @@ class HCSOINNClassifier:
                 pair_margin_penalty_np = (strength * pair_margin_score_np).astype(np.float32)
                 if np.any(pair_margin_gate_np):
                     penalty_t = torch.from_numpy(pair_margin_penalty_np).to(
+                        device=device, dtype=final_scores.dtype
+                    )
+                    final_scores = final_scores.clone()
+                    row_idx_t = torch.arange(N, device=device)
+                    final_scores[row_idx_t, compact_top1_idx_t] = (
+                        final_scores[row_idx_t, compact_top1_idx_t] + penalty_t
+                    )
+
+            topology_reliability_gap_np = np.zeros(N, dtype=np.float32)
+            topology_reliability_penalty_np = np.zeros(N, dtype=np.float32)
+            topology_reliability_gate_np = np.zeros(N, dtype=bool)
+            if bool(getattr(self, "use_topology_reliability_arbitration", False)):
+                topology_reliability_gap_np = self._topology_reliability_gap_numpy(
+                    selected_count_np,
+                    selected_residual_np,
+                    runner_count_np,
+                    runner_residual_np,
+                    compact_top1_labels_np,
+                    compact_top2_labels_np,
+                )
+                cap = float(getattr(self, "topology_reliability_margin_cap", 0.0))
+                min_gap = float(getattr(self, "topology_reliability_min_gap", 0.0))
+                penalty = float(getattr(self, "topology_reliability_penalty", 0.0))
+                topology_reliability_gate_np = np.logical_and.reduce((
+                    np.isfinite(compact_margin_np),
+                    compact_margin_np <= cap,
+                    topology_reliability_gap_np >= min_gap,
+                    compact_top1_idx_np != compact_top2_idx_np,
+                    np.full(N, penalty > 0.0, dtype=bool),
+                ))
+                if np.any(topology_reliability_gate_np):
+                    topology_reliability_penalty_np[topology_reliability_gate_np] = penalty
+                    penalty_t = torch.from_numpy(topology_reliability_penalty_np).to(
                         device=device, dtype=final_scores.dtype
                     )
                     final_scores = final_scores.clone()
@@ -6422,12 +6624,20 @@ class HCSOINNClassifier:
                 "selected_atom_weighted_usage_ema": selected_atom_weighted_usage_ema_np,
                 "selected_atom_abs_sum": selected_atom_abs_sum_np,
                 "selected_atom_entropy": selected_atom_entropy_np,
+                "runner_node": runner_node_np,
+                "runner_count": runner_count_np,
+                "runner_distance": runner_distance_np,
+                "runner_residual": runner_residual_np,
+                "runner_state": runner_state_np,
                 "atom_conflict_score": atom_conflict_score_np,
                 "atom_conflict_penalty": atom_conflict_penalty_np,
                 "atom_conflict_gate": atom_conflict_gate_np,
                 "pair_margin_score": pair_margin_score_np,
                 "pair_margin_penalty": pair_margin_penalty_np,
                 "pair_margin_gate": pair_margin_gate_np,
+                "topology_reliability_gap": topology_reliability_gap_np,
+                "topology_reliability_penalty": topology_reliability_penalty_np,
+                "topology_reliability_gate": topology_reliability_gate_np,
                 "raw_auxiliary_available": raw_auxiliary_available_np,
                 "fallback_available": fallback_available_np,
                 "fallback_top1_labels": fallback_top1_labels_np,
@@ -6500,6 +6710,23 @@ class HCSOINNClassifier:
             pair_stats["score_sum"] += float(np.sum(trace_info.get("pair_margin_score", np.zeros(samples))))
             pair_stats["penalty_sum"] += float(np.sum(trace_info.get("pair_margin_penalty", np.zeros(samples))))
 
+            topology_stats = self._topology_reliability_eval_stats
+            topology_gate = trace_info.get(
+                "topology_reliability_gate",
+                np.zeros(samples, dtype=bool),
+            ).astype(bool)
+            topology_stats["samples"] += float(samples)
+            topology_stats["gate_used"] += float(np.sum(topology_gate))
+            topology_stats["prediction_changed"] += float(
+                np.sum(np.logical_and(topology_gate, prediction_changed))
+            )
+            topology_stats["score_sum"] += float(
+                np.sum(trace_info.get("topology_reliability_gap", np.zeros(samples)))
+            )
+            topology_stats["penalty_sum"] += float(
+                np.sum(trace_info.get("topology_reliability_penalty", np.zeros(samples)))
+            )
+
             if bool(getattr(self, "use_raw_auxiliary_nodes", False)):
                 raw_aux_stats = self._raw_auxiliary_eval_stats
                 raw_aux_available = trace_info.get(
@@ -6546,6 +6773,15 @@ class HCSOINNClassifier:
                 )
                 pair_stats["harm_selected"] += float(
                     np.sum(np.logical_and.reduce((pair_changed, compact_correct, ~final_correct)))
+                )
+                topology_changed = np.logical_and(topology_gate, prediction_changed)
+                topology_stats["compact_correct"] += float(np.sum(compact_correct))
+                topology_stats["final_correct"] += float(np.sum(final_correct))
+                topology_stats["benefit_selected"] += float(
+                    np.sum(np.logical_and.reduce((topology_changed, ~compact_correct, final_correct)))
+                )
+                topology_stats["harm_selected"] += float(
+                    np.sum(np.logical_and.reduce((topology_changed, compact_correct, ~final_correct)))
                 )
                 if bool(getattr(self, "use_raw_auxiliary_nodes", False)):
                     raw_aux_stats = self._raw_auxiliary_eval_stats
@@ -6595,6 +6831,14 @@ class HCSOINNClassifier:
                         "pair_margin_score": float(trace_info["pair_margin_score"][row]),
                         "pair_margin_penalty": float(trace_info["pair_margin_penalty"][row]),
                         "pair_margin_used": bool(trace_info["pair_margin_gate"][row]),
+                        "runner_compact_node": int(trace_info["runner_node"][row]),
+                        "runner_compact_count": float(trace_info["runner_count"][row]),
+                        "runner_compact_distance": float(trace_info["runner_distance"][row]),
+                        "runner_node_residual": float(trace_info["runner_residual"][row]),
+                        "runner_node_state": str(trace_info["runner_state"][row]),
+                        "topology_reliability_gap": float(trace_info["topology_reliability_gap"][row]),
+                        "topology_reliability_penalty": float(trace_info["topology_reliability_penalty"][row]),
+                        "topology_reliability_used": bool(trace_info["topology_reliability_gate"][row]),
                         "raw_auxiliary_available": bool(trace_info["raw_auxiliary_available"][row]),
                         "raw_auxiliary_penalty": float(getattr(self, "raw_auxiliary_penalty", 0.0)),
                         "raw_auxiliary_scope": str(getattr(self, "raw_auxiliary_scope", "all")),

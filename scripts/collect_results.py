@@ -122,6 +122,12 @@ _RE_PAIR_MARGIN_FIT_LINE = re.compile(
 _RE_PAIR_MARGIN_VALUE = re.compile(
     r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
 )
+_RE_TOPOLOGY_RELIABILITY_LINE = re.compile(
+    r'\[LifeTopoDict\] Topology reliability arbitration:'
+)
+_RE_TOPOLOGY_RELIABILITY_VALUE = re.compile(
+    r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
+)
 _RE_CONFIG_PREFIX = re.compile(
     r'prefix:[ \t]*(.*)'
 )
@@ -400,6 +406,14 @@ def _parse_log_block(log_path: str, content: str, block_index: int) -> Dict[str,
             if parsed is not None:
                 result[f'pair_margin_{key}'] = parsed
 
+    topology_reliability_pos = content.rfind('[LifeTopoDict] Topology reliability arbitration:')
+    if topology_reliability_pos >= 0:
+        topology_reliability_line = content[topology_reliability_pos:].splitlines()[0]
+        for key, value in _RE_TOPOLOGY_RELIABILITY_VALUE.findall(topology_reliability_line):
+            parsed = _safe_float(value)
+            if parsed is not None:
+                result[f'topology_reliability_{key}'] = parsed
+
     return result
 
 
@@ -496,6 +510,7 @@ def write_csv(
         'memory_residual_penalty_mb', 'memory_residual_repair_mb',
         'memory_raw_aux_mb',
         'memory_pair_margin_mb',
+        'memory_topology_reliability_mb',
         'edge_use_rate', 'edge_class_use_rate', 'edge_margin_contribution',
         'edge_risk_penalty', 'edge_score_adjustment',
         'raw_auxiliary_enabled', 'raw_auxiliary_penalty',
@@ -518,6 +533,16 @@ def write_csv(
         'pair_margin_samples', 'pair_margin_deployed',
         'pair_margin_gain', 'pair_margin_gate_rate',
         'pair_margin_disabled',
+        'topology_reliability_enabled',
+        'topology_reliability_margin_cap',
+        'topology_reliability_min_gap',
+        'topology_reliability_penalty',
+        'topology_reliability_eval_gate_rate',
+        'topology_reliability_eval_change_rate',
+        'topology_reliability_eval_compact_acc',
+        'topology_reliability_eval_final_acc',
+        'topology_reliability_benefit',
+        'topology_reliability_harm',
     ]
 
     all_keys: List[str] = []

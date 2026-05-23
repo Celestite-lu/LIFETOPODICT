@@ -145,6 +145,15 @@ class Learner(BaseLearner):
         node_density_scoring_strength = args.get("node_density_scoring_strength", 0.0)
         node_density_scoring_mode = args.get("node_density_scoring_mode", "log_count")
         node_density_scoring_clip = args.get("node_density_scoring_clip", 2.0)
+        use_topology_reliability_arbitration = args.get(
+            "use_topology_reliability_arbitration", False
+        )
+        topology_reliability_margin_cap = args.get("topology_reliability_margin_cap", 0.02)
+        topology_reliability_min_gap = args.get("topology_reliability_min_gap", 0.5)
+        topology_reliability_penalty = args.get("topology_reliability_penalty", 0.03)
+        topology_reliability_count_weight = args.get("topology_reliability_count_weight", 1.0)
+        topology_reliability_residual_weight = args.get("topology_reliability_residual_weight", 2.0)
+        topology_reliability_mode = args.get("topology_reliability_mode", "count_residual")
 
         # --- Ablation switches. Growth and additive edge-aware scoring are
         # kept for historical reproducibility only; future experiments keep
@@ -253,6 +262,13 @@ class Learner(BaseLearner):
             node_density_scoring_strength=node_density_scoring_strength,
             node_density_scoring_mode=node_density_scoring_mode,
             node_density_scoring_clip=node_density_scoring_clip,
+            use_topology_reliability_arbitration=use_topology_reliability_arbitration,
+            topology_reliability_margin_cap=topology_reliability_margin_cap,
+            topology_reliability_min_gap=topology_reliability_min_gap,
+            topology_reliability_penalty=topology_reliability_penalty,
+            topology_reliability_count_weight=topology_reliability_count_weight,
+            topology_reliability_residual_weight=topology_reliability_residual_weight,
+            topology_reliability_mode=topology_reliability_mode,
         )
 
         # --- P0-4: Apply ablation switches (override defaults from HCSOINNClassifier) ---
@@ -364,6 +380,13 @@ class Learner(BaseLearner):
             f"node_density_scoring_strength={node_density_scoring_strength}, "
             f"node_density_scoring_mode={node_density_scoring_mode}, "
             f"node_density_scoring_clip={node_density_scoring_clip}, "
+            f"use_topology_reliability_arbitration={use_topology_reliability_arbitration}, "
+            f"topology_reliability_margin_cap={topology_reliability_margin_cap}, "
+            f"topology_reliability_min_gap={topology_reliability_min_gap}, "
+            f"topology_reliability_penalty={topology_reliability_penalty}, "
+            f"topology_reliability_count_weight={topology_reliability_count_weight}, "
+            f"topology_reliability_residual_weight={topology_reliability_residual_weight}, "
+            f"topology_reliability_mode={topology_reliability_mode}, "
             f"enable_prediction_trace={enable_prediction_trace}, "
             f"trace_split={trace_split}, "
             f"prediction_trace_output_dir={self._prediction_trace_output_dir}, "
@@ -409,6 +432,7 @@ class Learner(BaseLearner):
             f"raw_aux={mem.get('raw_auxiliary_model_mb', 0):.4f} MB, "
             f"class_score_norm={mem.get('class_score_normalization_model_mb', 0):.4f} MB, "
             f"node_density={mem.get('node_density_scoring_model_mb', 0):.4f} MB, "
+            f"topology_reliability={mem.get('topology_reliability_model_mb', 0):.4f} MB, "
             f"caches={mem.get('caches_mb', 0):.4f} MB, "
             f"buffers={mem.get('buffers_mb', 0):.4f} MB, "
             f"frozen={mem.get('frozen_mb', 0):.4f} MB"
@@ -541,6 +565,22 @@ class Learner(BaseLearner):
                 f"eval_gate_rate={pair_margin_stats.get('eval_gate_rate', 0):.4f}, "
                 f"eval_change_rate={pair_margin_stats.get('eval_change_rate', 0):.4f}, "
                 f"eval_final_acc={pair_margin_stats.get('eval_final_accuracy', 0):.4f}"
+            )
+        topology_reliability_stats = diag.get('topology_reliability_stats', {})
+        if topology_reliability_stats:
+            logging.info(
+                f"[LifeTopoDict] Topology reliability arbitration: "
+                f"enabled={int(topology_reliability_stats.get('enabled', 0))}, "
+                f"mode={topology_reliability_stats.get('mode', '')}, "
+                f"margin_cap={topology_reliability_stats.get('margin_cap', 0):.4f}, "
+                f"min_gap={topology_reliability_stats.get('min_gap', 0):.4f}, "
+                f"penalty={topology_reliability_stats.get('penalty', 0):.4f}, "
+                f"eval_gate_rate={topology_reliability_stats.get('eval_gate_rate', 0):.4f}, "
+                f"eval_change_rate={topology_reliability_stats.get('eval_change_rate', 0):.4f}, "
+                f"eval_compact_acc={topology_reliability_stats.get('eval_compact_accuracy', 0):.4f}, "
+                f"eval_final_acc={topology_reliability_stats.get('eval_final_accuracy', 0):.4f}, "
+                f"benefit={topology_reliability_stats.get('eval_benefit_selected', 0):.0f}, "
+                f"harm={topology_reliability_stats.get('eval_harm_selected', 0):.0f}"
             )
         if edge_stats:
             logging.info(
@@ -1089,6 +1129,8 @@ class Learner(BaseLearner):
             self.hc_soinn.reset_atom_conflict_eval_stats()
         if hasattr(self.hc_soinn, "reset_pair_margin_eval_stats"):
             self.hc_soinn.reset_pair_margin_eval_stats()
+        if hasattr(self.hc_soinn, "reset_topology_reliability_eval_stats"):
+            self.hc_soinn.reset_topology_reliability_eval_stats()
         from_cache = is_cached_feature_loader(loader)
         if not from_cache and self._network is None:
             raise RuntimeError(
