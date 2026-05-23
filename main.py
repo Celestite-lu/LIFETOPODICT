@@ -55,6 +55,11 @@ def main():
         'fallback_node_table_lambda',
         'enable_prediction_trace', 'trace_split', 'fallback_random_seed',
         'prediction_trace_output_dir', 'prediction_trace_dump_all_tasks',
+        'use_atom_conflict_gate', 'atom_conflict_metric',
+        'atom_conflict_target', 'atom_conflict_topk',
+        'atom_gate_strength', 'atom_gate_min_pair_support',
+        'atom_gate_smoothing', 'atom_gate_calibration_samples_per_class',
+        'atom_gate_calibration_cumulative',
         'use_feature_cache', 'feature_cache_dir', 'feature_cache_strict',
         'feature_cache_dtype', 'feature_cache_skip_backbone',
         'feature_cache_classifier_device',
@@ -210,6 +215,26 @@ def setup_parser():
                         help='Directory for JSONL prediction trace dumps.')
     parser.add_argument('--prediction_trace_dump_all_tasks', type=_str2bool, default=None,
                         help='Dump prediction trace after every eval task when trace output is enabled.')
+
+    # --- Direction 2: ATD-aware atom conflict gate ---
+    parser.add_argument('--use_atom_conflict_gate', type=_str2bool, default=None,
+                        help='Enable calibration-fit atom/class conflict reliability gate.')
+    parser.add_argument('--atom_conflict_metric', type=str, default=None,
+                        help='Atom conflict ranking: pmi, old_new_pmi, random, high_usage, or old_support.')
+    parser.add_argument('--atom_conflict_target', type=str, default=None,
+                        help='Calibration target for atom conflict: all_errors or old_new.')
+    parser.add_argument('--atom_conflict_topk', type=int, default=None,
+                        help='Number of positive atom/class conflict entries to deploy.')
+    parser.add_argument('--atom_gate_strength', type=float, default=None,
+                        help='Distance penalty multiplier for atom conflict score.')
+    parser.add_argument('--atom_gate_min_pair_support', type=int, default=None,
+                        help='Minimum calibration activations for an atom/class pair.')
+    parser.add_argument('--atom_gate_smoothing', type=float, default=None,
+                        help='Empirical-Bayes smoothing denominator for atom conflict rates.')
+    parser.add_argument('--atom_gate_calibration_samples_per_class', type=int, default=None,
+                        help='Per-class held-out train samples used to fit atom conflict gate.')
+    parser.add_argument('--atom_gate_calibration_cumulative', type=_str2bool, default=None,
+                        help='Fit atom conflict gate on cumulative held-out calibration samples.')
 
     # --- Feature cache parameters (can override JSON config via CLI) ---
     parser.add_argument('--use_feature_cache', type=_str2bool, default=None,

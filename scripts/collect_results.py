@@ -98,6 +98,12 @@ _RE_RAW_FALLBACK_GATE_FIT_LINE = re.compile(
 _RE_RAW_FALLBACK_GATE_VALUE = re.compile(
     r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
 )
+_RE_ATOM_CONFLICT_GATE_FIT_LINE = re.compile(
+    r'\[LifeTopoDict\] Atom conflict gate fit:'
+)
+_RE_ATOM_CONFLICT_GATE_VALUE = re.compile(
+    r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
+)
 _RE_CONFIG_PREFIX = re.compile(
     r'prefix:[ \t]*(.*)'
 )
@@ -344,6 +350,14 @@ def _parse_log_block(log_path: str, content: str, block_index: int) -> Dict[str,
             if parsed is not None:
                 result[f'raw_fallback_gate_{key}'] = parsed
 
+    atom_gate_pos = content.rfind('[LifeTopoDict] Atom conflict gate fit:')
+    if atom_gate_pos >= 0:
+        atom_gate_line = content[atom_gate_pos:].splitlines()[0]
+        for key, value in _RE_ATOM_CONFLICT_GATE_VALUE.findall(atom_gate_line):
+            parsed = _safe_float(value)
+            if parsed is not None:
+                result[f'atom_conflict_gate_{key}'] = parsed
+
     return result
 
 
@@ -445,6 +459,9 @@ def write_csv(
         'raw_fallback_gate_samples', 'raw_fallback_gate_positives',
         'raw_fallback_gate_gain', 'raw_fallback_gate_fallback_rate',
         'raw_fallback_gate_disabled',
+        'atom_conflict_gate_samples', 'atom_conflict_gate_errors',
+        'atom_conflict_gate_gain', 'atom_conflict_gate_gate_rate',
+        'atom_conflict_gate_deployed', 'atom_conflict_gate_disabled',
     ]
 
     all_keys: List[str] = []

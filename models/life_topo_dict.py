@@ -95,6 +95,17 @@ class Learner(BaseLearner):
         fallback_node_table_lambda = args.get("fallback_node_table_lambda", 0.5)
         enable_prediction_trace = args.get("enable_prediction_trace", False)
         trace_split = args.get("trace_split", "test")
+        use_atom_conflict_gate = args.get("use_atom_conflict_gate", False)
+        atom_conflict_metric = args.get("atom_conflict_metric", "pmi")
+        atom_conflict_target = args.get("atom_conflict_target", "all_errors")
+        atom_conflict_topk = args.get("atom_conflict_topk", 80)
+        atom_gate_strength = args.get("atom_gate_strength", 0.03)
+        atom_gate_min_pair_support = args.get("atom_gate_min_pair_support", 3)
+        atom_gate_smoothing = args.get("atom_gate_smoothing", 5.0)
+        atom_gate_calibration_samples_per_class = args.get(
+            "atom_gate_calibration_samples_per_class", 0
+        )
+        atom_gate_calibration_cumulative = args.get("atom_gate_calibration_cumulative", True)
 
         # --- Ablation switches. Growth and additive edge-aware scoring are
         # kept for historical reproducibility only; future experiments keep
@@ -165,6 +176,14 @@ class Learner(BaseLearner):
             enable_prediction_trace=enable_prediction_trace,
             trace_split=trace_split,
             fallback_random_seed=args.get("fallback_random_seed", args.get("seed", 0)),
+            use_atom_conflict_gate=use_atom_conflict_gate,
+            atom_conflict_metric=atom_conflict_metric,
+            atom_conflict_target=atom_conflict_target,
+            atom_conflict_topk=atom_conflict_topk,
+            atom_gate_strength=atom_gate_strength,
+            atom_gate_min_pair_support=atom_gate_min_pair_support,
+            atom_gate_smoothing=atom_gate_smoothing,
+            atom_gate_calibration_samples_per_class=atom_gate_calibration_samples_per_class,
         )
 
         # --- P0-4: Apply ablation switches (override defaults from HCSOINNClassifier) ---
@@ -178,6 +197,8 @@ class Learner(BaseLearner):
         self._hc_soinn_compressed_for_task = False
         self._fallback_calibration_cumulative = bool(fallback_calibration_cumulative)
         self._fallback_calibration_datasets = []
+        self._atom_gate_calibration_cumulative = bool(atom_gate_calibration_cumulative)
+        self._atom_gate_calibration_datasets = []
         self._prediction_trace_output_dir = args.get("prediction_trace_output_dir", None)
         self._prediction_trace_dump_all_tasks = bool(
             args.get("prediction_trace_dump_all_tasks", True)
@@ -229,6 +250,15 @@ class Learner(BaseLearner):
             f"fallback_pair_table_smoothing={fallback_pair_table_smoothing}, "
             f"fallback_pair_table_lambda={fallback_pair_table_lambda}, "
             f"fallback_node_table_lambda={fallback_node_table_lambda}, "
+            f"use_atom_conflict_gate={use_atom_conflict_gate}, "
+            f"atom_conflict_metric={atom_conflict_metric}, "
+            f"atom_conflict_target={atom_conflict_target}, "
+            f"atom_conflict_topk={atom_conflict_topk}, "
+            f"atom_gate_strength={atom_gate_strength}, "
+            f"atom_gate_min_pair_support={atom_gate_min_pair_support}, "
+            f"atom_gate_smoothing={atom_gate_smoothing}, "
+            f"atom_gate_calibration_samples_per_class={atom_gate_calibration_samples_per_class}, "
+            f"atom_gate_calibration_cumulative={atom_gate_calibration_cumulative}, "
             f"enable_prediction_trace={enable_prediction_trace}, "
             f"trace_split={trace_split}, "
             f"prediction_trace_output_dir={self._prediction_trace_output_dir}, "
@@ -266,6 +296,7 @@ class Learner(BaseLearner):
             f"edge_rel={mem.get('edge_reliability_mb', 0):.4f} MB, "
             f"fallback={mem.get('raw_fallback_total_mb', 0):.4f} MB, "
             f"fallback_gate={mem.get('raw_fallback_gate_model_mb', 0):.4f} MB, "
+            f"atom_gate={mem.get('atom_conflict_gate_model_mb', 0):.4f} MB, "
             f"caches={mem.get('caches_mb', 0):.4f} MB, "
             f"buffers={mem.get('buffers_mb', 0):.4f} MB, "
             f"frozen={mem.get('frozen_mb', 0):.4f} MB"
@@ -318,6 +349,26 @@ class Learner(BaseLearner):
                 f"threshold={fallback_gate_stats.get('threshold', 0):.6f}, "
                 f"weight_l2={fallback_gate_stats.get('weight_l2', 0):.4f}, "
                 f"disabled={int(fallback_gate_stats.get('gate_disabled', 0))}"
+            )
+        atom_gate_stats = diag.get('atom_conflict_gate_stats', {})
+        if atom_gate_stats:
+            logging.info(
+                f"[LifeTopoDict] Atom conflict gate fit: enabled={int(atom_gate_stats.get('enabled', 0))}, "
+                f"samples={int(atom_gate_stats.get('samples', 0))}, "
+                f"errors={int(atom_gate_stats.get('errors', 0))}, "
+                f"global_error={atom_gate_stats.get('global_error_rate', 0):.4f}, "
+                f"pairs={int(atom_gate_stats.get('pair_count', 0))}, "
+                f"deployed={int(atom_gate_stats.get('deployed_pairs', 0))}, "
+                f"metric={atom_gate_stats.get('metric', '')}, "
+                f"target={atom_gate_stats.get('target', '')}, "
+                f"strength={atom_gate_stats.get('strength', 0):.4f}, "
+                f"calib_acc={atom_gate_stats.get('calibration_accuracy', 0):.4f}, "
+                f"compact_acc={atom_gate_stats.get('compact_accuracy', 0):.4f}, "
+                f"gain={atom_gate_stats.get('calibration_gain', 0):.4f}, "
+                f"gate_rate={atom_gate_stats.get('calibration_gate_rate', 0):.4f}, "
+                f"benefit_sel={atom_gate_stats.get('calibration_benefit_selected', 0):.0f}, "
+                f"harm_sel={atom_gate_stats.get('calibration_harm_selected', 0):.0f}, "
+                f"disabled={int(atom_gate_stats.get('gate_disabled', 0))}"
             )
         if edge_stats:
             logging.info(
@@ -401,6 +452,7 @@ class Learner(BaseLearner):
         )
 
         fallback_calibration_loader = None
+        atom_gate_calibration_loader = None
 
         test_dataset = get_cached_feature_dataset(
             self.args,
@@ -436,12 +488,23 @@ class Learner(BaseLearner):
             and str(getattr(self.hc_soinn, "fallback_gate_type", "rule")).lower() in learned_gate_types
             and int(getattr(self.hc_soinn, "fallback_calibration_samples_per_class", 0)) > 0
         )
-        calibration_samples_per_class = int(
+        learned_atom_gate = (
+            bool(getattr(self.hc_soinn, "use_atom_conflict_gate", False))
+            and int(getattr(self.hc_soinn, "atom_gate_calibration_samples_per_class", 0)) > 0
+        )
+        fallback_calibration_samples_per_class = int(
             getattr(self.hc_soinn, "fallback_calibration_samples_per_class", 0)
         )
-        if learned_fallback_gate:
+        atom_gate_calibration_samples_per_class = int(
+            getattr(self.hc_soinn, "atom_gate_calibration_samples_per_class", 0)
+        )
+        calibration_samples_per_class = max(
+            fallback_calibration_samples_per_class if learned_fallback_gate else 0,
+            atom_gate_calibration_samples_per_class if learned_atom_gate else 0,
+        )
+        if learned_fallback_gate or learned_atom_gate:
             if train_dataset_for_hc is not None:
-                train_dataset_for_hc, fallback_calibration_dataset = get_cached_feature_dataset_split(
+                train_dataset_for_hc, calibration_dataset = get_cached_feature_dataset_split(
                     self.args,
                     data_manager,
                     np.arange(self._known_classes, self._total_classes),
@@ -449,29 +512,48 @@ class Learner(BaseLearner):
                     val_samples_per_class=calibration_samples_per_class,
                 )
             else:
-                train_dataset_for_hc, fallback_calibration_dataset = data_manager.get_dataset_with_split(
+                train_dataset_for_hc, calibration_dataset = data_manager.get_dataset_with_split(
                     np.arange(self._known_classes, self._total_classes),
                     source="train",
                     mode="test",
                     val_samples_per_class=calibration_samples_per_class,
                 )
-            if fallback_calibration_dataset is not None:
+            if calibration_dataset is not None and learned_fallback_gate:
                 if self._fallback_calibration_cumulative:
-                    self._fallback_calibration_datasets.append(fallback_calibration_dataset)
+                    self._fallback_calibration_datasets.append(calibration_dataset)
                     if len(self._fallback_calibration_datasets) == 1:
                         fallback_calibration_dataset = self._fallback_calibration_datasets[0]
                     else:
                         fallback_calibration_dataset = ConcatDataset(
                             list(self._fallback_calibration_datasets)
                         )
+                else:
+                    fallback_calibration_dataset = calibration_dataset
                 fallback_calibration_loader = DataLoader(
                     fallback_calibration_dataset,
                     batch_size=batch_size,
                     shuffle=False,
                     num_workers=num_workers,
                 )
+            if calibration_dataset is not None and learned_atom_gate:
+                if self._atom_gate_calibration_cumulative:
+                    self._atom_gate_calibration_datasets.append(calibration_dataset)
+                    if len(self._atom_gate_calibration_datasets) == 1:
+                        atom_gate_calibration_dataset = self._atom_gate_calibration_datasets[0]
+                    else:
+                        atom_gate_calibration_dataset = ConcatDataset(
+                            list(self._atom_gate_calibration_datasets)
+                        )
+                else:
+                    atom_gate_calibration_dataset = calibration_dataset
+                atom_gate_calibration_loader = DataLoader(
+                    atom_gate_calibration_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                )
         else:
-            fallback_calibration_dataset = None
+            calibration_dataset = None
         if train_dataset_for_hc is None:
             train_dataset_for_hc = data_manager.get_dataset(
                 np.arange(self._known_classes, self._total_classes),
@@ -488,6 +570,8 @@ class Learner(BaseLearner):
         log_feature_cache_loader(self.test_loader, "test_loader")
         if fallback_calibration_loader is not None:
             log_feature_cache_loader(fallback_calibration_loader, "fallback_calibration_loader")
+        if atom_gate_calibration_loader is not None:
+            log_feature_cache_loader(atom_gate_calibration_loader, "atom_gate_calibration_loader")
 
         if len(self._multiple_gpus) > 1 and self._network is not None:
             logging.info("Using multiple GPUs")
@@ -498,17 +582,68 @@ class Learner(BaseLearner):
             self.test_loader,
             self.train_loader_for_hc,
             fallback_calibration_loader=fallback_calibration_loader,
+            atom_gate_calibration_loader=atom_gate_calibration_loader,
         )
 
         if len(self._multiple_gpus) > 1 and self._network is not None:
             self._network = self._network.module
 
-    def _train(self, train_loader, test_loader, train_loader_for_hc, fallback_calibration_loader=None):
+    def _train(
+        self,
+        train_loader,
+        test_loader,
+        train_loader_for_hc,
+        fallback_calibration_loader=None,
+        atom_gate_calibration_loader=None,
+    ):
         if self._network is not None:
             self._network.to(self._device)
         self._extract_class_features(train_loader_for_hc, self._network)
         self._compress_task_boundary()
+        self._calibrate_atom_conflict_gate(atom_gate_calibration_loader)
         self._calibrate_raw_fallback_gate(fallback_calibration_loader)
+
+    def _calibrate_atom_conflict_gate(self, calibration_loader):
+        if calibration_loader is None:
+            return
+        if not hasattr(self.hc_soinn, "fit_atom_conflict_gate_from_trace"):
+            return
+        if not bool(getattr(self.hc_soinn, "use_atom_conflict_gate", False)):
+            return
+        logging.info(
+            "[LifeTopoDict] Calibrating atom conflict gate on %d samples "
+            "(metric=%s, target=%s, trace_split=%s).",
+            len(calibration_loader.dataset),
+            str(getattr(self.hc_soinn, "atom_conflict_metric", "pmi")),
+            str(getattr(self.hc_soinn, "atom_conflict_target", "all_errors")),
+            getattr(self.hc_soinn, "trace_split", "test"),
+        )
+        _ = self._eval_cnn(calibration_loader)
+        trace_records = self.hc_soinn.get_prediction_trace()
+        self._dump_prediction_trace_records(trace_records, split="atom_calibration")
+        fit_stats = self.hc_soinn.fit_atom_conflict_gate_from_trace(trace_records)
+        if fit_stats:
+            logging.info(
+                "[LifeTopoDict] Atom conflict gate fit: samples=%d, errors=%.0f, "
+                "global_error=%.4f, pairs=%d, deployed=%d, metric=%s, target=%s, "
+                "strength=%.4f, calib_acc=%.4f, compact_acc=%.4f, gain=%.4f, "
+                "gate_rate=%.4f, benefit_sel=%.0f, harm_sel=%.0f, disabled=%d",
+                int(fit_stats.get("samples", 0.0)),
+                float(fit_stats.get("errors", 0.0)),
+                float(fit_stats.get("global_error_rate", 0.0)),
+                int(fit_stats.get("pair_count", 0.0)),
+                int(fit_stats.get("deployed_pairs", 0.0)),
+                str(fit_stats.get("metric", "")),
+                str(fit_stats.get("target", "")),
+                float(fit_stats.get("strength", 0.0)),
+                float(fit_stats.get("calibration_accuracy", 0.0)),
+                float(fit_stats.get("compact_accuracy", 0.0)),
+                float(fit_stats.get("calibration_gain", 0.0)),
+                float(fit_stats.get("calibration_gate_rate", 0.0)),
+                float(fit_stats.get("calibration_benefit_selected", 0.0)),
+                float(fit_stats.get("calibration_harm_selected", 0.0)),
+                int(fit_stats.get("gate_disabled", 0.0)),
+            )
 
     def _calibrate_raw_fallback_gate(self, calibration_loader):
         if calibration_loader is None:
@@ -563,6 +698,8 @@ class Learner(BaseLearner):
         y_pred, y_true = [], []
         if hasattr(self.hc_soinn, "reset_raw_fallback_eval_stats"):
             self.hc_soinn.reset_raw_fallback_eval_stats(clear_trace=True)
+        if hasattr(self.hc_soinn, "reset_atom_conflict_eval_stats"):
+            self.hc_soinn.reset_atom_conflict_eval_stats()
         from_cache = is_cached_feature_loader(loader)
         if not from_cache and self._network is None:
             raise RuntimeError(

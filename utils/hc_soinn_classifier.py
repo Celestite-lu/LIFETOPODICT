@@ -411,6 +411,15 @@ class HCSOINNClassifier:
         enable_prediction_trace: bool = False,
         trace_split: str = "test",
         fallback_random_seed: int = 0,
+        # --- Direction 2: atom/class conflict gate ---
+        use_atom_conflict_gate: bool = False,
+        atom_conflict_metric: str = "pmi",
+        atom_conflict_target: str = "all_errors",
+        atom_conflict_topk: int = 80,
+        atom_gate_strength: float = 0.03,
+        atom_gate_min_pair_support: int = 3,
+        atom_gate_smoothing: float = 5.0,
+        atom_gate_calibration_samples_per_class: int = 0,
     ) -> None:
         self.max_prototypes_per_class = None if max_prototypes_per_class is None else int(
             max_prototypes_per_class
@@ -546,6 +555,25 @@ class HCSOINNClassifier:
         self.reset_raw_fallback_eval_stats(clear_trace=True)
 
         # ------------------------------------------------------------------ #
+        # Direction 2: ATD-aware shared-atom conflict gate.
+        # ------------------------------------------------------------------ #
+        self.use_atom_conflict_gate: bool = bool(use_atom_conflict_gate)
+        self.atom_conflict_metric: str = str(atom_conflict_metric).lower()
+        self.atom_conflict_target: str = str(atom_conflict_target).lower()
+        self.atom_conflict_topk: int = max(0, int(atom_conflict_topk))
+        self.atom_gate_strength: float = max(0.0, float(atom_gate_strength))
+        self.atom_gate_min_pair_support: int = max(1, int(atom_gate_min_pair_support))
+        self.atom_gate_smoothing: float = max(0.0, float(atom_gate_smoothing))
+        self.atom_gate_calibration_samples_per_class: int = max(
+            0, int(atom_gate_calibration_samples_per_class)
+        )
+        self._atom_conflict_gate_model: Dict[str, object] = {}
+        self._atom_conflict_gate_model_dirty: bool = True
+        self._atom_conflict_gate_fit_stats: Dict[str, object] = {}
+        self._atom_conflict_eval_stats: Dict[str, float] = {}
+        self.reset_atom_conflict_eval_stats()
+
+        # ------------------------------------------------------------------ #
         # LifeTopoDict: shared dictionary atoms and metadata
         # ------------------------------------------------------------------ #
         # dict_atoms: atom matrix [M, d]; same as dict_atoms_hat (all rows L2-normalised).
@@ -639,6 +667,20 @@ class HCSOINNClassifier:
         self._last_fallback_stats = self._summarize_raw_fallback_eval_stats()
         if clear_trace:
             self._prediction_trace_records = []
+
+    def reset_atom_conflict_eval_stats(self) -> None:
+        """Reset per-evaluation atom conflict gate accumulators."""
+        self._atom_conflict_eval_stats = {
+            "samples": 0.0,
+            "gate_used": 0.0,
+            "prediction_changed": 0.0,
+            "score_sum": 0.0,
+            "penalty_sum": 0.0,
+            "compact_correct": 0.0,
+            "final_correct": 0.0,
+            "benefit_selected": 0.0,
+            "harm_selected": 0.0,
+        }
 
     def get_prediction_trace(self) -> List[Dict[str, object]]:
         """Return the most recent eval prediction trace records."""
@@ -848,6 +890,289 @@ class HCSOINNClassifier:
         return {
             "raw_fallback_gate_model_bytes": total_bytes,
         }
+
+    def _atom_conflict_gate_model_bytes(self) -> Dict[str, float]:
+        """Return storage bytes for the atom/class conflict gate."""
+        model = getattr(self, "_atom_conflict_gate_model", {}) or {}
+        total_bytes = 0.0
+        for key in ("atom_indices", "class_ids", "scores"):
+            value = model.get(key)
+            if isinstance(value, np.ndarray):
+                total_bytes += float(value.nbytes)
+        if "strength" in model:
+            total_bytes += 8.0
+        if "global_error_rate" in model:
+            total_bytes += 8.0
+        table = model.get("score_table")
+        if isinstance(table, dict):
+            # Deployable sparse table: atom id, class id, score.
+            total_bytes += float(len(table) * (4 + 4 + 4))
+        return {
+            "atom_conflict_gate_model_bytes": total_bytes,
+        }
+
+    def _compute_atom_sharedness(self) -> Dict[int, float]:
+        """Estimate how broadly each atom is used across classes."""
+        if self.dict_atoms_hat is None or self.dict_atoms_hat.shape[0] == 0:
+            return {}
+        M = int(self.dict_atoms_hat.shape[0])
+        class_ids = sorted(self.class_clusters.keys())
+        if not class_ids:
+            return {m: 0.0 for m in range(M)}
+        class_to_col = {int(cls): idx for idx, cls in enumerate(class_ids)}
+        usage = np.zeros((M, len(class_ids)), dtype=np.float64)
+        for cls, clusters in self.class_clusters.items():
+            col = class_to_col[int(cls)]
+            for node in clusters:
+                coeff = getattr(node, "coeff", None)
+                if coeff is None:
+                    continue
+                coeff_arr = np.abs(np.asarray(coeff).reshape(-1))[:M]
+                positive = np.flatnonzero(coeff_arr > 1e-6)
+                if positive.size == 0:
+                    continue
+                usage[positive, col] += coeff_arr[positive]
+        sharedness: Dict[int, float] = {}
+        denom = np.log(max(2, len(class_ids)))
+        for m in range(M):
+            total = float(np.sum(usage[m]))
+            if total <= 0.0:
+                sharedness[m] = 0.0
+                continue
+            p = usage[m] / total
+            p = p[p > 0.0]
+            entropy = -float(np.sum(p * np.log(p + 1e-12)))
+            sharedness[m] = float(min(1.0, max(0.0, entropy / denom)))
+        return sharedness
+
+    def _atom_conflict_record_is_error(self, rec: Dict[str, object]) -> bool:
+        target = rec.get("target")
+        pred = rec.get("compact_top1", rec.get("selected_class"))
+        if target is None or pred is None:
+            return False
+        if int(target) == int(pred):
+            return False
+        target_mode = str(getattr(self, "atom_conflict_target", "all_errors")).lower()
+        if target_mode not in ("old_new", "old-new", "atd", "old_new_errors"):
+            return True
+        boundary = rec.get("known_class_boundary", rec.get("known_classes_before_task"))
+        if boundary is None:
+            return True
+        boundary = int(boundary)
+        if boundary <= 0:
+            return False
+        return bool((int(target) < boundary) != (int(pred) < boundary))
+
+    def _atom_conflict_lookup_scores(
+        self,
+        selected_atoms: List[List[int]],
+        selected_atom_weights: List[List[float]],
+        selected_classes: np.ndarray,
+    ) -> np.ndarray:
+        model = getattr(self, "_atom_conflict_gate_model", {}) or {}
+        if bool(getattr(self, "_atom_conflict_gate_model_dirty", True)):
+            return np.zeros(len(selected_classes), dtype=np.float32)
+        table = model.get("score_table")
+        if not isinstance(table, dict) or not table:
+            return np.zeros(len(selected_classes), dtype=np.float32)
+        scores = np.zeros(len(selected_classes), dtype=np.float32)
+        for row, cls in enumerate(selected_classes):
+            atoms = selected_atoms[row] if row < len(selected_atoms) else []
+            if not atoms:
+                continue
+            weights = selected_atom_weights[row] if row < len(selected_atom_weights) else []
+            if len(weights) != len(atoms):
+                weights_arr = np.full(len(atoms), 1.0 / float(len(atoms)), dtype=np.float32)
+            else:
+                weights_arr = np.asarray(weights, dtype=np.float32)
+                weight_sum = float(np.sum(weights_arr))
+                if weight_sum <= 0.0:
+                    weights_arr = np.full(len(atoms), 1.0 / float(len(atoms)), dtype=np.float32)
+                else:
+                    weights_arr = weights_arr / weight_sum
+            total = 0.0
+            for atom, weight in zip(atoms, weights_arr):
+                total += float(weight) * float(table.get((int(atom), int(cls)), 0.0))
+            scores[row] = float(total)
+        return scores
+
+    def fit_atom_conflict_gate_from_trace(
+        self,
+        trace_records: List[Dict[str, object]],
+    ) -> Dict[str, object]:
+        """Fit a sparse atom/class conflict table from held-out trace records."""
+        metric = str(getattr(self, "atom_conflict_metric", "pmi")).lower()
+        target = str(getattr(self, "atom_conflict_target", "all_errors")).lower()
+        strength = float(getattr(self, "atom_gate_strength", 0.0))
+        topk = int(getattr(self, "atom_conflict_topk", 0))
+        min_support = int(getattr(self, "atom_gate_min_pair_support", 1))
+        smoothing = float(getattr(self, "atom_gate_smoothing", 0.0))
+
+        if not trace_records or strength <= 0.0 or topk <= 0:
+            self._atom_conflict_gate_model = {}
+            self._atom_conflict_gate_model_dirty = True
+            self._atom_conflict_gate_fit_stats = {
+                "enabled": float(bool(getattr(self, "use_atom_conflict_gate", False))),
+                "samples": float(len(trace_records) if trace_records else 0),
+                "gate_disabled": 1.0,
+            }
+            return self._atom_conflict_gate_fit_stats
+
+        pair_count: Dict[Tuple[int, int], float] = defaultdict(float)
+        pair_errors: Dict[Tuple[int, int], float] = defaultdict(float)
+        samples = 0
+        errors = 0
+        compact_correct = 0
+        records_for_sim: List[Dict[str, object]] = []
+
+        for rec in trace_records:
+            atoms_raw = rec.get("selected_atom_topk", [])
+            if not isinstance(atoms_raw, list) or not atoms_raw:
+                continue
+            pred = rec.get("compact_top1", rec.get("selected_class"))
+            target_label = rec.get("target")
+            if pred is None or target_label is None:
+                continue
+            pred = int(pred)
+            is_error = self._atom_conflict_record_is_error(rec)
+            samples += 1
+            errors += int(is_error)
+            compact_correct += int(int(pred) == int(target_label))
+            records_for_sim.append(rec)
+            atoms = [int(a) for a in atoms_raw]
+            for atom in atoms:
+                key = (int(atom), pred)
+                pair_count[key] += 1.0
+                if is_error:
+                    pair_errors[key] += 1.0
+
+        if samples <= 0:
+            self._atom_conflict_gate_model = {}
+            self._atom_conflict_gate_model_dirty = True
+            self._atom_conflict_gate_fit_stats = {
+                "enabled": float(bool(getattr(self, "use_atom_conflict_gate", False))),
+                "samples": 0.0,
+                "gate_disabled": 1.0,
+            }
+            return self._atom_conflict_gate_fit_stats
+
+        global_error = float(errors) / float(samples)
+        base_rate = min(1.0 - 1e-6, max(1e-6, global_error))
+        sharedness = self._compute_atom_sharedness()
+        old_support = dict(getattr(self, "old_support", {}) or {})
+        usage = dict(getattr(self, "atom_usage_ema", {}) or {})
+        rng = np.random.RandomState(7919 + int(len(pair_count)) + int(samples))
+        scored: List[Tuple[float, int, int]] = []
+        for (atom, cls), count in pair_count.items():
+            if count < float(min_support):
+                continue
+            err = float(pair_errors.get((atom, cls), 0.0))
+            err_rate = (err + smoothing * base_rate) / (float(count) + smoothing)
+            if metric in ("random", "random_atom", "random_atom_class"):
+                score = float(rng.rand())
+            elif metric in ("high_usage", "usage"):
+                score = float(usage.get(atom, 0.0))
+            elif metric in ("old_support", "support"):
+                score = float(old_support.get(atom, 0.0))
+            else:
+                raw = np.log(max(1e-6, err_rate) / base_rate)
+                score = max(0.0, float(raw))
+                if metric in ("conflict_score", "pmi", "old_new_pmi"):
+                    score *= 0.5 + 0.5 * float(sharedness.get(atom, 0.0))
+            if score > 0.0:
+                scored.append((float(score), int(atom), int(cls)))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        selected = scored[:topk]
+        if not selected:
+            self._atom_conflict_gate_model = {}
+            self._atom_conflict_gate_model_dirty = True
+            self._atom_conflict_gate_fit_stats = {
+                "enabled": float(bool(getattr(self, "use_atom_conflict_gate", False))),
+                "samples": float(samples),
+                "errors": float(errors),
+                "global_error_rate": float(global_error),
+                "pair_count": float(len(pair_count)),
+                "deployed_pairs": 0.0,
+                "metric": metric,
+                "target": target,
+                "strength": float(strength),
+                "compact_accuracy": float(compact_correct) / float(max(1, samples)),
+                "calibration_accuracy": float(compact_correct) / float(max(1, samples)),
+                "calibration_gain": 0.0,
+                "calibration_gate_rate": 0.0,
+                "calibration_benefit_selected": 0.0,
+                "calibration_harm_selected": 0.0,
+                "gate_disabled": 1.0,
+            }
+            return self._atom_conflict_gate_fit_stats
+
+        atom_indices = np.asarray([a for _, a, _ in selected], dtype=np.int32)
+        class_ids = np.asarray([c for _, _, c in selected], dtype=np.int32)
+        scores = np.asarray([s for s, _, _ in selected], dtype=np.float32)
+        score_table = {
+            (int(atom), int(cls)): float(score)
+            for score, atom, cls in selected
+        }
+        self._atom_conflict_gate_model = {
+            "type": "atom_conflict",
+            "metric": metric,
+            "target": target,
+            "strength": float(strength),
+            "global_error_rate": float(global_error),
+            "atom_indices": atom_indices,
+            "class_ids": class_ids,
+            "scores": scores,
+            "score_table": score_table,
+        }
+        self._atom_conflict_gate_model_dirty = False
+
+        sim_compact_correct = 0
+        sim_final_correct = 0
+        sim_changed = 0
+        sim_benefit = 0
+        sim_harm = 0
+        for rec in records_for_sim:
+            pred = int(rec.get("compact_top1", rec.get("selected_class")))
+            top2 = int(rec.get("compact_top2", pred))
+            y = int(rec.get("target"))
+            atoms = [int(a) for a in rec.get("selected_atom_topk", [])]
+            if atoms:
+                gate_score = float(np.mean([score_table.get((a, pred), 0.0) for a in atoms]))
+            else:
+                gate_score = 0.0
+            margin = float(rec.get("compact_margin", np.inf))
+            changed = bool(gate_score > 0.0 and strength * gate_score > margin)
+            final_pred = top2 if changed else pred
+            compact_ok = pred == y
+            final_ok = final_pred == y
+            sim_compact_correct += int(compact_ok)
+            sim_final_correct += int(final_ok)
+            sim_changed += int(changed)
+            sim_benefit += int(changed and (not compact_ok) and final_ok)
+            sim_harm += int(changed and compact_ok and (not final_ok))
+
+        compact_acc = float(sim_compact_correct) / float(max(1, len(records_for_sim)))
+        final_acc = float(sim_final_correct) / float(max(1, len(records_for_sim)))
+        self._atom_conflict_gate_fit_stats = {
+            "enabled": float(bool(getattr(self, "use_atom_conflict_gate", False))),
+            "samples": float(samples),
+            "errors": float(errors),
+            "global_error_rate": float(global_error),
+            "pair_count": float(len(pair_count)),
+            "deployed_pairs": float(len(selected)),
+            "metric": metric,
+            "target": target,
+            "strength": float(strength),
+            "compact_accuracy": compact_acc,
+            "calibration_accuracy": final_acc,
+            "calibration_gain": final_acc - compact_acc,
+            "calibration_gate_rate": float(sim_changed) / float(max(1, len(records_for_sim))),
+            "calibration_benefit_selected": float(sim_benefit),
+            "calibration_harm_selected": float(sim_harm),
+            "gate_disabled": 0.0,
+        }
+        return self._atom_conflict_gate_fit_stats
 
     @staticmethod
     def _canonical_fallback_gate_type(gate_type: str) -> str:
@@ -3023,6 +3348,11 @@ class HCSOINNClassifier:
             fallback_gate_storage.get('raw_fallback_gate_model_bytes', 0.0)
         )
         breakdown.update(fallback_gate_storage)
+        atom_gate_storage = self._atom_conflict_gate_model_bytes()
+        atom_conflict_gate_model_bytes = float(
+            atom_gate_storage.get('atom_conflict_gate_model_bytes', 0.0)
+        )
+        breakdown.update(atom_gate_storage)
 
         if self.use_dict_coding and atom_deployable_bytes > 0.0:
             # Deployable LifeTopoDict storage keeps one atom matrix, sparse
@@ -3048,6 +3378,7 @@ class HCSOINNClassifier:
             )
         if getattr(self, 'fallback_memory_accounting', True):
             compact += raw_fallback_total_bytes + raw_fallback_gate_model_bytes
+        compact += atom_conflict_gate_model_bytes
         breakdown['compact_deployable_bytes'] = compact
 
         # --- Caches (inference predict cache) ---
@@ -3104,6 +3435,7 @@ class HCSOINNClassifier:
             node_center_bytes +
             raw_fallback_total_bytes +
             raw_fallback_gate_model_bytes +
+            atom_conflict_gate_model_bytes +
             cache_bytes +
             buffers_bytes +
             frozen_bytes +
@@ -3170,6 +3502,19 @@ class HCSOINNClassifier:
         predict_cache_filter_stats = dict(getattr(self, '_last_predict_cache_filter_stats', {}))
         fallback_stats = self._summarize_raw_fallback_eval_stats()
         fallback_gate_stats = dict(getattr(self, '_raw_fallback_gate_fit_stats', {}))
+        atom_gate_stats = dict(getattr(self, '_atom_conflict_gate_fit_stats', {}))
+        atom_eval_stats = dict(getattr(self, '_atom_conflict_eval_stats', {}))
+        if atom_gate_stats:
+            samples_eval = float(atom_eval_stats.get('samples', 0.0))
+            if samples_eval > 0.0:
+                atom_gate_stats.update({
+                    'eval_gate_rate': float(atom_eval_stats.get('gate_used', 0.0)) / samples_eval,
+                    'eval_change_rate': float(atom_eval_stats.get('prediction_changed', 0.0)) / samples_eval,
+                    'eval_compact_accuracy': float(atom_eval_stats.get('compact_correct', 0.0)) / samples_eval,
+                    'eval_final_accuracy': float(atom_eval_stats.get('final_correct', 0.0)) / samples_eval,
+                    'eval_benefit_selected': float(atom_eval_stats.get('benefit_selected', 0.0)),
+                    'eval_harm_selected': float(atom_eval_stats.get('harm_selected', 0.0)),
+                })
         self._last_fallback_stats = fallback_stats
         inactive_node_ratio = float(lifecycle_summary.get('inactive_node_ratio', 0.0))
         inactive_nodes_filtered = float(predict_cache_filter_stats.get('inactive_nodes_filtered', 0.0))
@@ -3195,6 +3540,7 @@ class HCSOINNClassifier:
             'edge_score_stats': dict(getattr(self, '_last_edge_score_stats', {})),
             'raw_fallback_stats': fallback_stats,
             'raw_fallback_gate_stats': fallback_gate_stats,
+            'atom_conflict_gate_stats': atom_gate_stats,
         }
 
         logging.info(
@@ -3220,6 +3566,8 @@ class HCSOINNClassifier:
         self._raw_fallback_predict_cache.clear()
         self._raw_fallback_gate_model_dirty = True
         self._raw_fallback_gate_model = {}
+        self._atom_conflict_gate_model_dirty = True
+        self._atom_conflict_gate_model = {}
 
     # ------------------------------------------------------------------ #
     # Inference profiling helpers
@@ -4458,6 +4806,7 @@ class HCSOINNClassifier:
         trace_enabled = bool(
             getattr(self, 'enable_prediction_trace', False)
             or getattr(self, 'use_raw_fallback_gate', False)
+            or getattr(self, 'use_atom_conflict_gate', False)
         )
         valid_classes_np = np.array(valid_classes, dtype=np.int64)
         trace_info = None
@@ -4504,6 +4853,7 @@ class HCSOINNClassifier:
             selected_distance_np = np.full(N, np.nan, dtype=np.float32)
             selected_state_np = np.array(["unknown"] * N, dtype=object)
             selected_atoms: List[List[int]] = [[] for _ in range(N)]
+            selected_atom_weights: List[List[float]] = [[] for _ in range(N)]
             selected_atom_inactive_ratio_np = np.zeros(N, dtype=np.float32)
             selected_atom_plastic_ratio_np = np.zeros(N, dtype=np.float32)
             selected_atom_protected_ratio_np = np.zeros(N, dtype=np.float32)
@@ -4543,6 +4893,7 @@ class HCSOINNClassifier:
                             weight_sum = float(np.sum(top_weights))
                             if weight_sum > 0.0:
                                 probs = top_weights / weight_sum
+                                selected_atom_weights[row] = [float(v) for v in probs]
                                 states = [str(self.atom_states[int(i)]) if int(i) < len(self.atom_states) else "plastic" for i in top_atoms]
                                 old_support_vals = np.asarray(
                                     [float(self.old_support.get(int(i), 0.0)) for i in top_atoms],
@@ -4567,6 +4918,28 @@ class HCSOINNClassifier:
                                 selected_atom_weighted_usage_ema_np[row] = float(np.sum(probs * usage_vals))
                                 selected_atom_abs_sum_np[row] = float(weight_sum)
                                 selected_atom_entropy_np[row] = float(-np.sum(probs * np.log(probs + 1e-12)))
+
+            atom_conflict_score_np = np.zeros(N, dtype=np.float32)
+            atom_conflict_penalty_np = np.zeros(N, dtype=np.float32)
+            atom_conflict_gate_np = np.zeros(N, dtype=bool)
+            if bool(getattr(self, "use_atom_conflict_gate", False)):
+                atom_conflict_score_np = self._atom_conflict_lookup_scores(
+                    selected_atoms,
+                    selected_atom_weights,
+                    compact_top1_labels_np,
+                )
+                strength = float(getattr(self, "atom_gate_strength", 0.0))
+                atom_conflict_penalty_np = (strength * atom_conflict_score_np).astype(np.float32)
+                atom_conflict_gate_np = atom_conflict_penalty_np > 0.0
+                if np.any(atom_conflict_gate_np):
+                    penalty_t = torch.from_numpy(atom_conflict_penalty_np).to(
+                        device=device, dtype=final_scores.dtype
+                    )
+                    final_scores = final_scores.clone()
+                    row_idx_t = torch.arange(N, device=device)
+                    final_scores[row_idx_t, compact_top1_idx_t] = (
+                        final_scores[row_idx_t, compact_top1_idx_t] + penalty_t
+                    )
 
             fallback_scores = None
             fallback_available_np = np.zeros(N, dtype=bool)
@@ -4940,6 +5313,7 @@ class HCSOINNClassifier:
                 "selected_residual": selected_residual_np,
                 "selected_state": selected_state_np,
                 "selected_atoms": selected_atoms,
+                "selected_atom_weights": selected_atom_weights,
                 "selected_atom_inactive_ratio": selected_atom_inactive_ratio_np,
                 "selected_atom_plastic_ratio": selected_atom_plastic_ratio_np,
                 "selected_atom_protected_ratio": selected_atom_protected_ratio_np,
@@ -4951,6 +5325,9 @@ class HCSOINNClassifier:
                 "selected_atom_weighted_usage_ema": selected_atom_weighted_usage_ema_np,
                 "selected_atom_abs_sum": selected_atom_abs_sum_np,
                 "selected_atom_entropy": selected_atom_entropy_np,
+                "atom_conflict_score": atom_conflict_score_np,
+                "atom_conflict_penalty": atom_conflict_penalty_np,
+                "atom_conflict_gate": atom_conflict_gate_np,
                 "fallback_available": fallback_available_np,
                 "fallback_top1_labels": fallback_top1_labels_np,
                 "fallback_top2_labels": fallback_top2_labels_np,
@@ -5006,6 +5383,14 @@ class HCSOINNClassifier:
                 stats["fallback_margin_sum"] += float(np.nansum(trace_info["compact_margin"][fallback_gate]))
                 stats["fallback_residual_sum"] += float(np.nansum(trace_info["selected_residual"][fallback_gate]))
 
+            atom_stats = self._atom_conflict_eval_stats
+            atom_gate = trace_info.get("atom_conflict_gate", np.zeros(samples, dtype=bool)).astype(bool)
+            atom_stats["samples"] += float(samples)
+            atom_stats["gate_used"] += float(np.sum(atom_gate))
+            atom_stats["prediction_changed"] += float(np.sum(np.logical_and(atom_gate, prediction_changed)))
+            atom_stats["score_sum"] += float(np.sum(trace_info.get("atom_conflict_score", np.zeros(samples))))
+            atom_stats["penalty_sum"] += float(np.sum(trace_info.get("atom_conflict_penalty", np.zeros(samples))))
+
             if targets_np is not None and targets_np.shape[0] == samples:
                 compact_correct = compact_pred == targets_np
                 final_correct = final_pred == targets_np
@@ -5025,10 +5410,22 @@ class HCSOINNClassifier:
                 stats["benefit_selected"] += float(np.sum(np.logical_and(fallback_gate, benefit_mask)))
                 stats["harm_selected"] += float(np.sum(np.logical_and(fallback_gate, harm_mask)))
                 stats["neutral_selected"] += float(np.sum(np.logical_and(fallback_gate, neutral_mask)))
+                atom_changed = np.logical_and(atom_gate, prediction_changed)
+                atom_stats["compact_correct"] += float(np.sum(compact_correct))
+                atom_stats["final_correct"] += float(np.sum(final_correct))
+                atom_stats["benefit_selected"] += float(
+                    np.sum(np.logical_and.reduce((atom_changed, ~compact_correct, final_correct)))
+                )
+                atom_stats["harm_selected"] += float(
+                    np.sum(np.logical_and.reduce((atom_changed, compact_correct, ~final_correct)))
+                )
 
             if getattr(self, "enable_prediction_trace", False):
+                boundary_for_trace = getattr(self, "known_classes_before_task", 0)
+                boundary_for_trace = 0 if boundary_for_trace is None else int(boundary_for_trace)
                 for row in range(samples):
                     record = {
+                        "known_class_boundary": int(boundary_for_trace),
                         "compact_top1": int(compact_pred[row]),
                         "compact_top2": int(trace_info["compact_top2_labels"][row]),
                         "compact_top1_score": float(trace_info["compact_top1_score"][row]),
@@ -5041,6 +5438,7 @@ class HCSOINNClassifier:
                         "selected_node_residual": float(trace_info["selected_residual"][row]),
                         "selected_node_state": str(trace_info["selected_state"][row]),
                         "selected_atom_topk": trace_info["selected_atoms"][row],
+                        "selected_atom_weights": trace_info["selected_atom_weights"][row],
                         "selected_atom_inactive_ratio": float(trace_info["selected_atom_inactive_ratio"][row]),
                         "selected_atom_plastic_ratio": float(trace_info["selected_atom_plastic_ratio"][row]),
                         "selected_atom_protected_ratio": float(trace_info["selected_atom_protected_ratio"][row]),
@@ -5052,6 +5450,9 @@ class HCSOINNClassifier:
                         "selected_atom_weighted_usage_ema": float(trace_info["selected_atom_weighted_usage_ema"][row]),
                         "selected_atom_abs_sum": float(trace_info["selected_atom_abs_sum"][row]),
                         "selected_atom_entropy": float(trace_info["selected_atom_entropy"][row]),
+                        "atom_conflict_score": float(trace_info["atom_conflict_score"][row]),
+                        "atom_conflict_penalty": float(trace_info["atom_conflict_penalty"][row]),
+                        "atom_conflict_used": bool(trace_info["atom_conflict_gate"][row]),
                         "fallback_available": bool(fallback_available[row]),
                         "fallback_used": bool(fallback_gate[row]),
                         "fallback_top1": int(fallback_pred[row]),
