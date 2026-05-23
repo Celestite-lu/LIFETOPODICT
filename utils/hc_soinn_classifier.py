@@ -447,6 +447,13 @@ class HCSOINNClassifier:
         use_node_residual_repair: bool = False,
         node_residual_repair_per_class: int = 0,
         node_residual_repair_select_by: str = "residual",
+        # --- Train-set compact node risk scoring ---
+        use_train_node_risk_penalty: bool = False,
+        train_node_risk_strength: float = 0.0,
+        train_node_risk_topk: int = 80,
+        train_node_risk_smoothing: float = 5.0,
+        train_node_risk_min_visits: int = 2,
+        train_node_risk_metric: str = "error_rate",
         # --- Class-level dictionary residual geometry repair ---
         use_class_residual_repair: bool = False,
         class_residual_repair_strength: float = 0.25,
@@ -685,6 +692,15 @@ class HCSOINNClassifier:
         self.node_residual_repair_select_by: str = str(
             node_residual_repair_select_by
         ).lower()
+
+        self.use_train_node_risk_penalty: bool = bool(use_train_node_risk_penalty)
+        self.train_node_risk_strength: float = max(0.0, float(train_node_risk_strength))
+        self.train_node_risk_topk: int = max(0, int(train_node_risk_topk))
+        self.train_node_risk_smoothing: float = max(0.0, float(train_node_risk_smoothing))
+        self.train_node_risk_min_visits: int = max(1, int(train_node_risk_min_visits))
+        self.train_node_risk_metric: str = str(train_node_risk_metric).lower()
+        self.train_node_risk_table: Dict[Tuple[int, int], float] = {}
+        self._train_node_risk_fit_stats: Dict[str, object] = {}
 
         # ------------------------------------------------------------------ #
         # Class residual geometry repair. Stores one train-only residual vector
@@ -1581,6 +1597,198 @@ class HCSOINNClassifier:
                 float(np.mean(all_residuals)) if all_residuals else 0.0
             ),
         }
+
+    def _train_node_risk_model_bytes(self) -> Dict[str, float]:
+        """Return deployable storage for sparse train-fit node risk scores."""
+        total_bytes = 0.0
+        if bool(getattr(self, "use_train_node_risk_penalty", False)):
+            table = getattr(self, "train_node_risk_table", {}) or {}
+            # Sparse table: class id, node id, risk score.
+            total_bytes += float(len(table) * (4 + 4 + 4))
+            # Strength, topk, smoothing, min-visits, and metric metadata.
+            total_bytes += 8.0 * 5.0
+        return {
+            "train_node_risk_model_bytes": total_bytes,
+            "train_node_risk_entries": float(
+                len(getattr(self, "train_node_risk_table", {}) or {})
+            ),
+        }
+
+    def _summarize_train_node_risk_stats(self) -> Dict[str, object]:
+        """Return latest train node risk fit diagnostics."""
+        if not bool(getattr(self, "use_train_node_risk_penalty", False)):
+            return {}
+        stats = dict(getattr(self, "_train_node_risk_fit_stats", {}) or {})
+        table = getattr(self, "train_node_risk_table", {}) or {}
+        values = list(table.values())
+        stats.update({
+            "enabled": 1.0,
+            "deployed_nodes": float(len(table)),
+            "strength": float(getattr(self, "train_node_risk_strength", 0.0)),
+            "metric": str(getattr(self, "train_node_risk_metric", "")),
+            "risk_mean": float(np.mean(values)) if values else 0.0,
+            "risk_max": float(np.max(values)) if values else 0.0,
+        })
+        return stats
+
+    def _train_node_risk_adjustment_values(
+        self,
+        proto_class_index_t: torch.Tensor,
+        proto_node_index_t: torch.Tensor,
+        valid_classes: List[int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return per-prototype distance penalties from train-fit node risk."""
+        if (
+            not bool(getattr(self, "use_train_node_risk_penalty", False))
+            or float(getattr(self, "train_node_risk_strength", 0.0)) <= 1e-12
+        ):
+            return torch.zeros_like(proto_node_index_t, device=device, dtype=torch.float32)
+        table = getattr(self, "train_node_risk_table", {}) or {}
+        if not table:
+            return torch.zeros_like(proto_node_index_t, device=device, dtype=torch.float32)
+        class_index_np = proto_class_index_t.detach().cpu().numpy().astype(np.int64, copy=False)
+        node_index_np = proto_node_index_t.detach().cpu().numpy().astype(np.int64, copy=False)
+        classes_np = np.asarray(valid_classes, dtype=np.int64)
+        values = np.zeros(node_index_np.shape[0], dtype=np.float32)
+        strength = float(getattr(self, "train_node_risk_strength", 0.0))
+        for i, (class_pos, node_idx) in enumerate(zip(class_index_np, node_index_np)):
+            if node_idx < 0 or class_pos < 0 or class_pos >= classes_np.shape[0]:
+                continue
+            key = (int(classes_np[int(class_pos)]), int(node_idx))
+            values[i] = float(table.get(key, 0.0)) * strength
+        return torch.from_numpy(values).to(device=device, dtype=torch.float32)
+
+    def fit_train_node_risk_penalty(
+        self,
+        features: np.ndarray,
+        labels: np.ndarray,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, object]:
+        """Fit sparse node-risk penalties from current-task train features."""
+        if (
+            not bool(getattr(self, "use_train_node_risk_penalty", False))
+            or float(getattr(self, "train_node_risk_strength", 0.0)) <= 1e-12
+            or int(getattr(self, "train_node_risk_topk", 0)) <= 0
+        ):
+            self.train_node_risk_table = {}
+            self._train_node_risk_fit_stats = {
+                "enabled": float(bool(getattr(self, "use_train_node_risk_penalty", False))),
+                "samples": 0.0,
+                "gate_disabled": 1.0,
+            }
+            return self._train_node_risk_fit_stats
+
+        features = np.asarray(features, dtype=np.float32)
+        labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+        if features.shape[0] == 0 or labels.shape[0] != features.shape[0]:
+            self.train_node_risk_table = {}
+            self._train_node_risk_fit_stats = {
+                "enabled": 1.0,
+                "samples": 0.0,
+                "gate_disabled": 1.0,
+            }
+            return self._train_node_risk_fit_stats
+
+        total_classes = max(max(self.class_mu.keys(), default=-1) + 1, int(labels.max()) + 1)
+        fit_device = device if device is not None else torch.device("cpu")
+        original_enabled = bool(getattr(self, "use_train_node_risk_penalty", False))
+        original_trace = bool(getattr(self, "enable_prediction_trace", False))
+        original_trace_split = str(getattr(self, "trace_split", "test"))
+        original_trace_records = list(getattr(self, "_prediction_trace_records", []))
+        old_table = dict(getattr(self, "train_node_risk_table", {}) or {})
+        self.train_node_risk_table = {}
+        self.use_train_node_risk_penalty = False
+        self.enable_prediction_trace = True
+        self.trace_split = "train_node_risk"
+        self._prediction_trace_records = []
+        try:
+            _ = self.predict_topk(
+                features,
+                topk=2,
+                total_classes=total_classes,
+                device=fit_device,
+                targets=labels,
+            )
+            trace_records = self.get_prediction_trace()
+        finally:
+            self.use_train_node_risk_penalty = original_enabled
+            self.enable_prediction_trace = original_trace
+            self.trace_split = original_trace_split
+            self._prediction_trace_records = original_trace_records
+
+        visits: Dict[Tuple[int, int], float] = defaultdict(float)
+        errors: Dict[Tuple[int, int], float] = defaultdict(float)
+        counts: Dict[Tuple[int, int], float] = defaultdict(float)
+        samples = 0
+        error_total = 0
+        for rec in trace_records:
+            pred = rec.get("compact_top1")
+            target = rec.get("target")
+            node_idx = rec.get("nearest_compact_node")
+            if pred is None or target is None or node_idx is None:
+                continue
+            node_idx = int(node_idx)
+            if node_idx < 0:
+                continue
+            key = (int(pred), node_idx)
+            samples += 1
+            visits[key] += 1.0
+            counts[key] += float(rec.get("selected_node_count", 1.0))
+            is_error = int(pred) != int(target)
+            errors[key] += float(is_error)
+            error_total += int(is_error)
+
+        if samples <= 0:
+            self.train_node_risk_table = old_table
+            self._train_node_risk_fit_stats = {
+                "enabled": 1.0,
+                "samples": 0.0,
+                "gate_disabled": 1.0,
+            }
+            return self._train_node_risk_fit_stats
+
+        smoothing = float(getattr(self, "train_node_risk_smoothing", 5.0))
+        min_visits = int(getattr(self, "train_node_risk_min_visits", 2))
+        base_rate = min(1.0 - 1e-6, max(1e-6, float(error_total) / float(samples)))
+        metric = str(getattr(self, "train_node_risk_metric", "error_rate")).lower()
+        rng = np.random.RandomState(31337 + int(samples) + int(len(visits)))
+        scored: List[Tuple[float, Tuple[int, int]]] = []
+        for key, visit_count in visits.items():
+            if visit_count < float(min_visits):
+                continue
+            err = float(errors.get(key, 0.0))
+            err_rate = (err + smoothing * base_rate) / (float(visit_count) + smoothing)
+            if metric in ("random", "random_control"):
+                score = float(rng.rand())
+            elif metric in ("high_count", "count", "support"):
+                score = float(counts.get(key, 0.0)) / max(1.0, float(visit_count))
+            elif metric in ("pmi", "log_ratio"):
+                score = max(0.0, float(np.log(max(1e-6, err_rate) / base_rate)))
+            else:
+                score = max(0.0, float(err_rate - base_rate))
+            if score > 0.0:
+                scored.append((float(score), key))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        selected = scored[: int(getattr(self, "train_node_risk_topk", 0))]
+        self.train_node_risk_table = {key: float(score) for score, key in selected}
+        values = list(self.train_node_risk_table.values())
+        compact_acc = 1.0 - float(error_total) / float(max(1, samples))
+        self._train_node_risk_fit_stats = {
+            "enabled": 1.0,
+            "samples": float(samples),
+            "errors": float(error_total),
+            "compact_accuracy": float(compact_acc),
+            "node_count": float(len(visits)),
+            "deployed_nodes": float(len(self.train_node_risk_table)),
+            "metric": metric,
+            "strength": float(getattr(self, "train_node_risk_strength", 0.0)),
+            "risk_mean": float(np.mean(values)) if values else 0.0,
+            "risk_max": float(np.max(values)) if values else 0.0,
+            "gate_disabled": 0.0 if values else 1.0,
+        }
+        return self._train_node_risk_fit_stats
 
     def _class_residual_repair_model_bytes(self) -> Dict[str, float]:
         """Return deployable storage for class-level residual correction vectors."""
@@ -4462,6 +4670,11 @@ class HCSOINNClassifier:
         pair_margin_storage = self._pair_margin_model_bytes()
         pair_margin_model_bytes = float(pair_margin_storage.get('pair_margin_model_bytes', 0.0))
         breakdown.update(pair_margin_storage)
+        train_node_risk_storage = self._train_node_risk_model_bytes()
+        train_node_risk_model_bytes = float(
+            train_node_risk_storage.get('train_node_risk_model_bytes', 0.0)
+        )
+        breakdown.update(train_node_risk_storage)
         residual_penalty_storage = self._node_residual_penalty_model_bytes()
         node_residual_penalty_model_bytes = float(
             residual_penalty_storage.get('node_residual_penalty_model_bytes', 0.0)
@@ -4525,6 +4738,7 @@ class HCSOINNClassifier:
         compact += atom_conflict_gate_model_bytes
         compact += score_bias_model_bytes
         compact += pair_margin_model_bytes
+        compact += train_node_risk_model_bytes
         compact += node_residual_penalty_model_bytes
         compact += node_residual_repair_model_bytes
         compact += class_residual_repair_model_bytes
@@ -4591,6 +4805,7 @@ class HCSOINNClassifier:
             atom_conflict_gate_model_bytes +
             score_bias_model_bytes +
             pair_margin_model_bytes +
+            train_node_risk_model_bytes +
             node_residual_penalty_model_bytes +
             node_residual_repair_model_bytes +
             class_residual_repair_model_bytes +
@@ -4674,6 +4889,7 @@ class HCSOINNClassifier:
         )
         class_score_norm_stats = dict(getattr(self, '_class_score_norm_fit_stats', {}))
         node_residual_repair_stats = self._summarize_node_residual_repair_stats()
+        train_node_risk_stats = self._summarize_train_node_risk_stats()
         class_residual_repair_stats = self._summarize_class_residual_repair_stats()
         if atom_gate_stats:
             samples_eval = float(atom_eval_stats.get('samples', 0.0))
@@ -4765,6 +4981,7 @@ class HCSOINNClassifier:
             'topology_reliability_stats': topology_reliability_stats,
             'class_score_normalization_stats': class_score_norm_stats,
             'node_residual_repair_stats': node_residual_repair_stats,
+            'train_node_risk_stats': train_node_risk_stats,
             'class_residual_repair_stats': class_residual_repair_stats,
         }
 
@@ -5995,13 +6212,24 @@ class HCSOINNClassifier:
         proto_residual_penalty_t = self._node_residual_penalty_values(proto_residual_t, device)
         proto_count_t = self._predict_cache.get("proto_count_t")
         proto_class_mean_count_t = self._predict_cache.get("proto_class_mean_count_t")
+        proto_node_index_t = self._predict_cache.get("proto_node_index_t")
         if not isinstance(proto_count_t, torch.Tensor):
             proto_count_t = torch.ones(all_protos_t.shape[0], device=device, dtype=torch.float32)
         if not isinstance(proto_class_mean_count_t, torch.Tensor):
             proto_class_mean_count_t = torch.ones(all_protos_t.shape[0], device=device, dtype=torch.float32)
+        if not isinstance(proto_node_index_t, torch.Tensor):
+            proto_node_index_t = torch.full(
+                (all_protos_t.shape[0],), -1, device=device, dtype=torch.long
+            )
         proto_density_adjustment_t = self._node_density_adjustment_values(
             proto_count_t,
             proto_class_mean_count_t,
+            device,
+        )
+        proto_train_node_risk_t = self._train_node_risk_adjustment_values(
+            proto_class_index_t,
+            proto_node_index_t,
+            valid_classes,
             device,
         )
 
@@ -6031,6 +6259,7 @@ class HCSOINNClassifier:
             filtered_class_index = proto_class_index_t[filtered_indices]   # [M']
             filtered_residual_penalty = proto_residual_penalty_t[filtered_indices]
             filtered_density_adjustment = proto_density_adjustment_t[filtered_indices]
+            filtered_train_node_risk = proto_train_node_risk_t[filtered_indices]
 
             dist_filtered = 1.0 - torch.mm(q_norm, filtered_protos.t())    # [N, M']
             if filtered_residual_penalty.numel() > 0:
@@ -6039,6 +6268,10 @@ class HCSOINNClassifier:
                 )
             if filtered_density_adjustment.numel() > 0:
                 dist_filtered = dist_filtered + filtered_density_adjustment.view(1, -1).to(
+                    device=device, dtype=dist_filtered.dtype
+                )
+            if filtered_train_node_risk.numel() > 0:
+                dist_filtered = dist_filtered + filtered_train_node_risk.view(1, -1).to(
                     device=device, dtype=dist_filtered.dtype
                 )
 
@@ -6066,6 +6299,10 @@ class HCSOINNClassifier:
                 )
             if proto_density_adjustment_t.numel() > 0:
                 dist_proto_all = dist_proto_all + proto_density_adjustment_t.view(1, -1).to(
+                    device=device, dtype=dist_proto_all.dtype
+                )
+            if proto_train_node_risk_t.numel() > 0:
+                dist_proto_all = dist_proto_all + proto_train_node_risk_t.view(1, -1).to(
                     device=device, dtype=dist_proto_all.dtype
                 )
 
@@ -6182,6 +6419,10 @@ class HCSOINNClassifier:
                     )
                 if proto_density_adjustment_t.numel() > 0:
                     dist_proto_all = dist_proto_all + proto_density_adjustment_t.view(1, -1).to(
+                        device=device, dtype=dist_proto_all.dtype
+                    )
+                if proto_train_node_risk_t.numel() > 0:
+                    dist_proto_all = dist_proto_all + proto_train_node_risk_t.view(1, -1).to(
                         device=device, dtype=dist_proto_all.dtype
                     )
                 if stage_trace_t0 is not None:

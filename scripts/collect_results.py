@@ -134,6 +134,12 @@ _RE_CLASS_RESIDUAL_REPAIR_LINE = re.compile(
 _RE_CLASS_RESIDUAL_REPAIR_VALUE = re.compile(
     r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
 )
+_RE_TRAIN_NODE_RISK_LINE = re.compile(
+    r'\[LifeTopoDict\] Train node risk:'
+)
+_RE_TRAIN_NODE_RISK_VALUE = re.compile(
+    r'([A-Za-z_]+)=([A-Za-z_]+|[-\d.eEnaN+]+)'
+)
 _RE_CONFIG_PREFIX = re.compile(
     r'prefix:[ \t]*(.*)'
 )
@@ -428,6 +434,16 @@ def _parse_log_block(log_path: str, content: str, block_index: int) -> Dict[str,
             if parsed is not None:
                 result[f'class_residual_repair_{key}'] = parsed
 
+    train_node_risk_pos = content.rfind('[LifeTopoDict] Train node risk:')
+    if train_node_risk_pos >= 0:
+        train_node_risk_line = content[train_node_risk_pos:].splitlines()[0]
+        for key, value in _RE_TRAIN_NODE_RISK_VALUE.findall(train_node_risk_line):
+            parsed = _safe_float(value)
+            if parsed is not None:
+                result[f'train_node_risk_{key}'] = parsed
+            elif key == 'metric':
+                result['train_node_risk_metric'] = value
+
     return result
 
 
@@ -522,6 +538,7 @@ def write_csv(
         'memory_caches_mb', 'memory_buffers_mb', 'memory_frozen_mb',
         'memory_fallback_mb', 'memory_fallback_gate_mb',
         'memory_residual_penalty_mb', 'memory_residual_repair_mb',
+        'memory_train_node_risk_mb',
         'memory_raw_aux_mb',
         'memory_pair_margin_mb',
         'memory_topology_reliability_mb',
@@ -565,6 +582,17 @@ def write_csv(
         'class_residual_repair_min_nodes',
         'class_residual_repair_vector_norm_mean',
         'class_residual_repair_vector_norm_max',
+        'train_node_risk_enabled',
+        'train_node_risk_samples',
+        'train_node_risk_errors',
+        'train_node_risk_compact_acc',
+        'train_node_risk_nodes',
+        'train_node_risk_deployed',
+        'train_node_risk_metric',
+        'train_node_risk_strength',
+        'train_node_risk_mean',
+        'train_node_risk_max',
+        'train_node_risk_disabled',
     ]
 
     all_keys: List[str] = []

@@ -74,6 +74,9 @@ def main():
         'node_residual_penalty_mode',
         'use_node_residual_repair', 'node_residual_repair_per_class',
         'node_residual_repair_select_by',
+        'use_train_node_risk_penalty', 'train_node_risk_strength',
+        'train_node_risk_topk', 'train_node_risk_smoothing',
+        'train_node_risk_min_visits', 'train_node_risk_metric',
         'use_class_residual_repair', 'class_residual_repair_strength',
         'class_residual_repair_min_nodes', 'class_residual_repair_mode',
         'use_class_score_normalization', 'class_score_norm_mode',
@@ -291,6 +294,18 @@ def setup_parser():
                         help='Number of nodes per class to repair with raw centers.')
     parser.add_argument('--node_residual_repair_select_by', type=str, default=None,
                         help='Residual repair node ranking: residual, count, residual_count, low_residual, or random_control.')
+    parser.add_argument('--use_train_node_risk_penalty', type=_str2bool, default=None,
+                        help='Enable train-set compact node risk penalty.')
+    parser.add_argument('--train_node_risk_strength', type=float, default=None,
+                        help='Distance penalty multiplier for train-fit risky compact nodes.')
+    parser.add_argument('--train_node_risk_topk', type=int, default=None,
+                        help='Number of risky compact nodes to deploy.')
+    parser.add_argument('--train_node_risk_smoothing', type=float, default=None,
+                        help='Empirical-Bayes smoothing for train node risk rates.')
+    parser.add_argument('--train_node_risk_min_visits', type=int, default=None,
+                        help='Minimum train winner visits required for a node-risk entry.')
+    parser.add_argument('--train_node_risk_metric', type=str, default=None,
+                        help='Node risk ranking: error_rate, pmi, random_control, or high_count.')
     parser.add_argument('--use_class_residual_repair', type=_str2bool, default=None,
                         help='Apply class-level dictionary residual correction to materialized compact nodes.')
     parser.add_argument('--class_residual_repair_strength', type=float, default=None,
