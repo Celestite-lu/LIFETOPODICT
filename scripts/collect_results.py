@@ -465,6 +465,7 @@ def write_csv(
         'memory_edges_mb', 'memory_edge_rel_mb', 'memory_edge_reliability_mb',
         'memory_caches_mb', 'memory_buffers_mb', 'memory_frozen_mb',
         'memory_fallback_mb', 'memory_fallback_gate_mb',
+        'memory_residual_penalty_mb',
         'edge_use_rate', 'edge_class_use_rate', 'edge_margin_contribution',
         'edge_risk_penalty', 'edge_score_adjustment',
         'raw_fallback_rate', 'raw_fallback_compact_acc',

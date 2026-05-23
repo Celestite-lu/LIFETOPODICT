@@ -63,6 +63,8 @@ def main():
         'use_score_bias_calibration', 'score_bias_calibration_samples_per_class',
         'score_bias_calibration_cumulative', 'score_bias_grid',
         'score_bias_min_gain',
+        'use_node_residual_penalty', 'node_residual_penalty_strength',
+        'node_residual_penalty_mode',
         'use_feature_cache', 'feature_cache_dir', 'feature_cache_strict',
         'feature_cache_dtype', 'feature_cache_skip_backbone',
         'feature_cache_classifier_device',
@@ -229,6 +231,12 @@ def setup_parser():
                         help='Comma-separated candidate new-class score biases; lower scores are better.')
     parser.add_argument('--score_bias_min_gain', type=float, default=None,
                         help='Minimum calibration accuracy gain required to deploy a nonzero score bias.')
+    parser.add_argument('--use_node_residual_penalty', type=_str2bool, default=None,
+                        help='Penalize compact topology node distances by dictionary reconstruction residual.')
+    parser.add_argument('--node_residual_penalty_strength', type=float, default=None,
+                        help='Strength for node residual distance penalty.')
+    parser.add_argument('--node_residual_penalty_mode', type=str, default=None,
+                        help='Node residual penalty mode: linear, sqrt, or random_control.')
 
     # --- Direction 2: ATD-aware atom conflict gate ---
     parser.add_argument('--use_atom_conflict_gate', type=_str2bool, default=None,

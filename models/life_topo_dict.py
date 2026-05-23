@@ -116,6 +116,9 @@ class Learner(BaseLearner):
             "-0.03,-0.02,-0.015,-0.01,-0.005,0,0.005,0.01,0.015,0.02,0.03",
         )
         score_bias_min_gain = args.get("score_bias_min_gain", 0.0)
+        use_node_residual_penalty = args.get("use_node_residual_penalty", False)
+        node_residual_penalty_strength = args.get("node_residual_penalty_strength", 0.0)
+        node_residual_penalty_mode = args.get("node_residual_penalty_mode", "linear")
 
         # --- Ablation switches. Growth and additive edge-aware scoring are
         # kept for historical reproducibility only; future experiments keep
@@ -198,6 +201,9 @@ class Learner(BaseLearner):
             score_bias_calibration_samples_per_class=score_bias_calibration_samples_per_class,
             score_bias_grid=score_bias_grid,
             score_bias_min_gain=score_bias_min_gain,
+            use_node_residual_penalty=use_node_residual_penalty,
+            node_residual_penalty_strength=node_residual_penalty_strength,
+            node_residual_penalty_mode=node_residual_penalty_mode,
         )
 
         # --- P0-4: Apply ablation switches (override defaults from HCSOINNClassifier) ---
@@ -280,6 +286,9 @@ class Learner(BaseLearner):
             f"score_bias_calibration_cumulative={score_bias_calibration_cumulative}, "
             f"score_bias_grid={score_bias_grid}, "
             f"score_bias_min_gain={score_bias_min_gain}, "
+            f"use_node_residual_penalty={use_node_residual_penalty}, "
+            f"node_residual_penalty_strength={node_residual_penalty_strength}, "
+            f"node_residual_penalty_mode={node_residual_penalty_mode}, "
             f"enable_prediction_trace={enable_prediction_trace}, "
             f"trace_split={trace_split}, "
             f"prediction_trace_output_dir={self._prediction_trace_output_dir}, "
@@ -319,6 +328,7 @@ class Learner(BaseLearner):
             f"fallback_gate={mem.get('raw_fallback_gate_model_mb', 0):.4f} MB, "
             f"atom_gate={mem.get('atom_conflict_gate_model_mb', 0):.4f} MB, "
             f"score_bias={mem.get('score_bias_model_mb', 0):.4f} MB, "
+            f"residual_penalty={mem.get('node_residual_penalty_model_mb', 0):.4f} MB, "
             f"caches={mem.get('caches_mb', 0):.4f} MB, "
             f"buffers={mem.get('buffers_mb', 0):.4f} MB, "
             f"frozen={mem.get('frozen_mb', 0):.4f} MB"
