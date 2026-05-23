@@ -514,9 +514,17 @@ Classify the failure:
 
 After two failed repair attempts, log the idea as `crash` or `discard` and move on.
 
-## Priority Idea Queue
+## Starting Point For The Next Agent
 
-The list below is a priority queue, not a prison. The agent should start with high-priority ideas, but may add new families when the current family is exhausted or when paper reading reveals a stronger path. Any new family must satisfy:
+Start from `docs/Innovation_design/LifeTopoDict新方向详细方案.md`, specifically:
+
+```text
+方向二：ATD-Aware Shared-Atom Conflict Detection + Atom-Class Gate
+```
+
+This is only a starting point, not a fixed plan. The agent must read the relevant docs and code, then design the actual experiment plan itself. Do not copy a stale checklist from this `program.md`; use the current repository state, latest reports, and paper summaries to decide what to try.
+
+When developing ideas, the agent must satisfy these constraints:
 
 ```text
 uses compressed/shared HC-SOINN nodes as the substrate
@@ -526,185 +534,7 @@ has controls that can falsify the proposed mechanism
 is motivated or sanity-checked against docs/paper/
 ```
 
-### P0: Direction 2 Atom-Conflict Gate
-
-Hypothesis:
-
-```text
-Some shared dictionary atoms are correlated with old-new confusion. Class-conditional atom gates can reduce harmful atom contribution and improve HM/A_Last without adding much memory.
-```
-
-Minimum implementation:
-
-- Compute atom-class binding from node coefficients and node counts.
-- On calibration samples, accumulate per-atom and per-class-pair error counters.
-- Compute conflict scores:
-
-```text
-sharedness(atom)
-old_support(atom)
-new_usage(atom)
-PMI(atom, old_to_new_error)
-PMI(atom, class_pair_error)
-conflict(atom, class) or conflict(atom, class_pair)
-```
-
-- Add inference-time downweight, not additive edge scoring:
-
-```text
-node_reliability(i, c) = 1 - strength * mean_abs_coeff_conflict(i, c)
-adjusted_score(x, node_i) = score(x, node_i) * node_reliability(i, c)
-```
-
-Controls:
-
-```text
-random atom downweight
-high-usage-only downweight
-old-support-only downweight
-trace-only no-op
-```
-
-Search:
-
-```text
-atom_conflict_topk in {5, 10, 20, 40}
-atom_gate_strength in {0.05, 0.10, 0.20, 0.35, 0.50}
-scope in {global, class_conditional, class_pair}
-metric in {old_new_pmi, class_pair_pmi, conflict_score}
-```
-
-Kill criterion:
-
-```text
-No seed-1993 variant improves HM by >= +0.20pp while keeping A_Last drop <= 0.10pp.
-```
-
-Promote criterion:
-
-```text
-CUB 3-seed mean A_Last >= raw + 0.10pp
-or CUB 3-seed mean HM >= raw + 0.20pp with A_Last >= raw - 0.10pp
-```
-
-### P1: Dictionary Reconstruction And Scoring Improvements
-
-Hypothesis:
-
-```text
-Accuracy loss comes from reconstruction/scoring mismatch rather than insufficient memory. Better normalization, whitening, coefficient calibration, or residual-aware scoring can recover accuracy without raw fallback.
-```
-
-Ideas:
-
-- Verify atom L2 norms and coefficient scales per task.
-- Try normalized atom storage and normalized reconstruction consistently.
-- Try PCA/whitening before dictionary encoding, then unwhiten for scoring.
-- Try ridge lambda/k joint schedules:
-
-```text
-(k, lambda) in {(8,0.01), (12,0.01), (12,0.03), (15,0.03), (15,0.05)}
-```
-
-- Try residual-aware node score calibration:
-
-```text
-score' = score - beta * node_residual
-beta selected on calibration only
-```
-
-- Try class-age temperature or margin calibration selected on calibration.
-
-Controls:
-
-```text
-no calibration
-random residual penalty
-same memory raw HC-SOINN reference
-```
-
-Do not re-enable dictionary growth as the first response to high residual.
-
-### P2: Safer Raw Repair After Direction 1
-
-Direction 1 failed as a main claim, but oracle remains high. Only revisit it with a materially different calibration method.
-
-Allowed ideas:
-
-- Out-of-fold calibration to enlarge calibration positives.
-- Compact top-K constrained raw challenge with stored compact top5/top10.
-- Class-pair-only fallback where calibration has positive lower confidence bound.
-- Raw cache pruning only if it reduces harm and memory together.
-
-Do not simply increase fallback rate or raw cache size. That already failed the conceptual test.
-
-### P3: Optimizer / Offline Dictionary Fitting
-
-The current classifier path is mostly non-gradient HC-SOINN + closed-form sparse coding. Optimizer experiments are allowed only when they create a real trainable component.
-
-Allowed ideas:
-
-- Learn a small calibration layer over compact logits on held-out calibration.
-- Learn atom gates with L1/entropy regularization using calibration only.
-- Learn class-wise score temperatures.
-- Fit dictionary atoms with a constrained objective on base/train features, then freeze them.
-
-Required controls:
-
-```text
-calibration-only no test tuning
-parameter memory counted
-raw HC-SOINN same-feature baseline
-selected compact baseline
-randomized labels or random gates when relevant
-```
-
-### P4: Broader Hyperparameter Search
-
-Only run broad search after a mechanism shows a single-seed signal.
-
-Search candidates:
-
-```text
-dict_sparse_k: {8, 12, 15}
-dict_ridge_lambda: {0.01, 0.03, 0.05, 0.10}
-lifecycle_theta_support: {0.5, 0.7, 0.9}
-lifecycle_node_inactive_threshold: {0.0, 0.1, 0.2, 0.4}
-lifecycle_theta_usage: {0.01, 0.03, 0.05}
-```
-
-Avoid wasting runs on already closed dimensions:
-
-```text
-dict_max_growth_per_task
-use_edge_aware_scoring
-edge_score_gamma
-edge_score_eta
-```
-
-### P5: Paper-Driven New Architectures Around The Same Base
-
-This bucket is for creative mechanisms beyond Direction 1 and Direction 2. It is encouraged when the agent has read relevant papers and can explain why the mechanism should help compressed shared HC-SOINN nodes.
-
-Allowed architecture families:
-
-- ATD/task-confusion-aware calibration inspired by CIL papers.
-- Prototype debiasing or old/new balance calibration that uses LifeTopoDict node scores.
-- Dictionary-learning improvements inspired by sparse autoencoder / archetypal / coherence papers.
-- Atom specialization, atom routing, or class-conditional atom masking.
-- Compact residual adapters that correct reconstructed node centers without storing full raw nodes.
-- Memory-budgeted expert routing where the expert is still a compact topology component.
-- OOD/uncertainty-inspired confidence calibration if it can be computed from compact node geometry.
-
-Disallowed as main methods:
-
-- Replacing LifeTopoDict with a standalone neural classifier.
-- Fine-tuning the backbone.
-- Adding FC fusion that bypasses topology unless it is a diagnostic control.
-- Increasing raw fallback cache as the main solution.
-- Any method that beats raw HC-SOINN only by using more deployable memory than raw.
-
-Before implementing a P5 idea, the run report must include:
+The agent is encouraged to create new method families beyond the previously drafted directions. Before implementing any new architecture or mechanism, the run report must include:
 
 ```text
 paper/source inspiration
