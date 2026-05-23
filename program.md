@@ -221,6 +221,83 @@ timestamp	tag	seed	dataset	method	A_Avg	A_Last	selected_rel_A_Last	raw_rel_A_Las
 
 Do not commit `results.tsv` unless the user explicitly asks for committed logs.
 
+## Git Automation And Rollback
+
+Git is the safety rail for autonomous research. The agent should use it automatically, but conservatively.
+
+Authentication:
+
+- Do not store GitHub tokens in remote URLs, scripts, config files, logs, or reports.
+- Prefer SSH authentication:
+
+```bash
+git remote set-url origin git@github.com:Celestite-lu/LIFETOPODICT.git
+```
+
+- If HTTPS is used, rely on an OS credential manager or GitHub CLI login outside this program. Never paste a token into a command.
+- If push authentication is unavailable, keep local commits and continue. Local rollback is still valid.
+
+Stable anchors:
+
+```bash
+git tag -a baseline-before-autoresearch -m "Baseline snapshot before autonomous LifeTopoDict experiments"
+git checkout -b autoresearch/lifetopo-<date>
+```
+
+If the tag or branch already exists, reuse it. Do not recreate or overwrite tags unless the user explicitly asks.
+
+Per-experiment workflow:
+
+```bash
+git status --short
+EXP_START=$(git rev-parse HEAD)
+```
+
+The working tree should be clean except for ignored logs/results. If tracked files are dirty, inspect them before starting; do not overwrite unknown user edits.
+
+After implementing an idea:
+
+```bash
+git add <changed code/config/docs>
+git commit -m "exp(<tag>): <short hypothesis>"
+EXP_COMMIT=$(git rev-parse HEAD)
+```
+
+Then run the experiment. When judging the result:
+
+```text
+success or useful infrastructure -> keep commit, optionally add a follow-up report commit
+failure with no reusable value -> git reset --hard "$EXP_START"
+crash from typo -> fix and amend/rerun once
+```
+
+Rollback rules:
+
+- Only reset back to the `EXP_START` captured at the beginning of the current experiment.
+- Never reset across user-created commits or edits.
+- Never run `git clean -fdx`; it can delete data, logs, and caches.
+- If unsure whether a file is user-created, leave it alone and record the uncertainty.
+- Ignored experiment logs under `logs/` may remain after rollback; that is fine.
+
+Useful commands:
+
+```bash
+git log --oneline --decorate -10
+git diff --stat "$EXP_START"..HEAD
+git reset --hard "$EXP_START"
+git checkout baseline-before-autoresearch
+git checkout autoresearch/lifetopo-<date>
+```
+
+Push policy:
+
+```bash
+git push -u origin autoresearch/lifetopo-<date>
+git push origin main --tags
+```
+
+Push only kept commits. Do not push failed experiment commits unless they are explicitly kept as diagnostic infrastructure.
+
 ## Baselines To Keep At Hand
 
 Use these as same-feature comparators:
@@ -248,15 +325,31 @@ For single-seed experiments, always compare against a same-run or same-seed comp
 LOOP FOREVER until interrupted by the user.
 
 1. Read `logs/autoresearch/results.tsv` and the latest relevant reports.
-2. Pick one idea with a concrete hypothesis and a kill criterion. If this is a new mechanism, first read relevant summaries in `docs/paper/` and write a short rationale in the run report before coding.
-3. Implement the smallest code/config change needed to test it.
-4. Run a syntax check:
+2. Capture the rollback point:
+
+```bash
+git status --short
+EXP_START=$(git rev-parse HEAD)
+```
+
+3. Pick one idea with a concrete hypothesis and a kill criterion. If this is a new mechanism, first read relevant summaries in `docs/paper/` and write a short rationale in the run report before coding.
+4. Implement the smallest code/config change needed to test it.
+5. Commit the experimental code/config before running:
+
+```bash
+git add <changed code/config/docs>
+git commit -m "exp(<tag>): <short hypothesis>"
+```
+
+If there are no tracked code/config changes because the run only uses CLI overrides, record the hypothesis in `logs/autoresearch/results.tsv` and continue without a commit.
+
+6. Run a syntax check:
 
 ```bash
 python -m py_compile main.py models/life_topo_dict.py utils/hc_soinn_classifier.py utils/feature_cache.py scripts/collect_results.py
 ```
 
-5. Run a quick smoke test when code changed:
+7. Run a quick smoke test when code changed:
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
@@ -268,7 +361,7 @@ python main.py \
   > logs/autoresearch/smoke_<tag>.log 2>&1
 ```
 
-6. Run the smallest meaningful experiment:
+8. Run the smallest meaningful experiment:
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<gpu> \
@@ -279,7 +372,7 @@ python main.py \
   > logs/autoresearch/<tag>_cub_seed1993.log 2>&1
 ```
 
-7. Collect results:
+9. Collect results:
 
 ```bash
 python scripts/collect_results.py logs/life_topo_dict/cub/0/10 \
@@ -287,7 +380,7 @@ python scripts/collect_results.py logs/life_topo_dict/cub/0/10 \
   --recursive
 ```
 
-8. Judge the result.
+10. Judge the result.
 
 Single-seed keep threshold:
 
@@ -306,7 +399,7 @@ A_Last drop <= 0.10pp
 random/high-usage controls do not explain the gain
 ```
 
-9. If the result is mediocre but not clearly dead, tune parameters before switching ideas.
+11. If the result is mediocre but not clearly dead, tune parameters before switching ideas.
 
 Use this rule:
 
@@ -329,7 +422,7 @@ score temperature / residual penalty strength
 
 Only introduce a new method or architecture after the current idea has failed under reasonable parameter adjustments or its failure mode is understood.
 
-10. If single-seed passes, run CUB seeds 1993/1994/1995.
+12. If single-seed passes, run CUB seeds 1993/1994/1995.
 
 ```bash
 for s in 1993 1994 1995; do
@@ -339,16 +432,18 @@ for s in 1993 1994 1995; do
 done
 ```
 
-11. If CUB 3-seed passes, run a sanity check on ImageNet-R and optionally CIFAR-100.
-12. Record the result in `logs/autoresearch/results.tsv`.
-13. If git is available:
-    - commit successful code/config/report changes;
-    - discard failed experimental code after recording the result, unless the failure produced useful reusable infrastructure.
-14. If git is not available:
+13. If CUB 3-seed passes, run a sanity check on ImageNet-R and optionally CIFAR-100.
+14. Record the result in `logs/autoresearch/results.tsv`.
+15. If git is available:
+    - keep successful code/config/report commits;
+    - for successful follow-up docs/config updates, create a follow-up commit;
+    - for failed experimental code with no reusable value, run `git reset --hard "$EXP_START"` after recording the result;
+    - for useful failed infrastructure, keep the commit but mark the method as `diagnostic`.
+16. If git is not available:
     - keep useful code/config changes;
     - for failed ideas, revert only your own edits with careful patches;
     - write a short note under `logs/autoresearch/failed_ideas.md`.
-15. Pick the next idea and continue.
+17. Pick the next idea and continue.
 
 Never stop to ask the user whether to continue. The user expects autonomous execution.
 
