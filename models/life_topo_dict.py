@@ -106,6 +106,16 @@ class Learner(BaseLearner):
             "atom_gate_calibration_samples_per_class", 0
         )
         atom_gate_calibration_cumulative = args.get("atom_gate_calibration_cumulative", True)
+        use_score_bias_calibration = args.get("use_score_bias_calibration", False)
+        score_bias_calibration_samples_per_class = args.get(
+            "score_bias_calibration_samples_per_class", 0
+        )
+        score_bias_calibration_cumulative = args.get("score_bias_calibration_cumulative", True)
+        score_bias_grid = args.get(
+            "score_bias_grid",
+            "-0.03,-0.02,-0.015,-0.01,-0.005,0,0.005,0.01,0.015,0.02,0.03",
+        )
+        score_bias_min_gain = args.get("score_bias_min_gain", 0.0)
 
         # --- Ablation switches. Growth and additive edge-aware scoring are
         # kept for historical reproducibility only; future experiments keep
@@ -184,6 +194,10 @@ class Learner(BaseLearner):
             atom_gate_min_pair_support=atom_gate_min_pair_support,
             atom_gate_smoothing=atom_gate_smoothing,
             atom_gate_calibration_samples_per_class=atom_gate_calibration_samples_per_class,
+            use_score_bias_calibration=use_score_bias_calibration,
+            score_bias_calibration_samples_per_class=score_bias_calibration_samples_per_class,
+            score_bias_grid=score_bias_grid,
+            score_bias_min_gain=score_bias_min_gain,
         )
 
         # --- P0-4: Apply ablation switches (override defaults from HCSOINNClassifier) ---
@@ -199,6 +213,8 @@ class Learner(BaseLearner):
         self._fallback_calibration_datasets = []
         self._atom_gate_calibration_cumulative = bool(atom_gate_calibration_cumulative)
         self._atom_gate_calibration_datasets = []
+        self._score_bias_calibration_cumulative = bool(score_bias_calibration_cumulative)
+        self._score_bias_calibration_datasets = []
         self._prediction_trace_output_dir = args.get("prediction_trace_output_dir", None)
         self._prediction_trace_dump_all_tasks = bool(
             args.get("prediction_trace_dump_all_tasks", True)
@@ -259,6 +275,11 @@ class Learner(BaseLearner):
             f"atom_gate_smoothing={atom_gate_smoothing}, "
             f"atom_gate_calibration_samples_per_class={atom_gate_calibration_samples_per_class}, "
             f"atom_gate_calibration_cumulative={atom_gate_calibration_cumulative}, "
+            f"use_score_bias_calibration={use_score_bias_calibration}, "
+            f"score_bias_calibration_samples_per_class={score_bias_calibration_samples_per_class}, "
+            f"score_bias_calibration_cumulative={score_bias_calibration_cumulative}, "
+            f"score_bias_grid={score_bias_grid}, "
+            f"score_bias_min_gain={score_bias_min_gain}, "
             f"enable_prediction_trace={enable_prediction_trace}, "
             f"trace_split={trace_split}, "
             f"prediction_trace_output_dir={self._prediction_trace_output_dir}, "
@@ -297,6 +318,7 @@ class Learner(BaseLearner):
             f"fallback={mem.get('raw_fallback_total_mb', 0):.4f} MB, "
             f"fallback_gate={mem.get('raw_fallback_gate_model_mb', 0):.4f} MB, "
             f"atom_gate={mem.get('atom_conflict_gate_model_mb', 0):.4f} MB, "
+            f"score_bias={mem.get('score_bias_model_mb', 0):.4f} MB, "
             f"caches={mem.get('caches_mb', 0):.4f} MB, "
             f"buffers={mem.get('buffers_mb', 0):.4f} MB, "
             f"frozen={mem.get('frozen_mb', 0):.4f} MB"
@@ -453,6 +475,7 @@ class Learner(BaseLearner):
 
         fallback_calibration_loader = None
         atom_gate_calibration_loader = None
+        score_bias_calibration_loader = None
 
         test_dataset = get_cached_feature_dataset(
             self.args,
@@ -492,17 +515,25 @@ class Learner(BaseLearner):
             bool(getattr(self.hc_soinn, "use_atom_conflict_gate", False))
             and int(getattr(self.hc_soinn, "atom_gate_calibration_samples_per_class", 0)) > 0
         )
+        learned_score_bias = (
+            bool(getattr(self.hc_soinn, "use_score_bias_calibration", False))
+            and int(getattr(self.hc_soinn, "score_bias_calibration_samples_per_class", 0)) > 0
+        )
         fallback_calibration_samples_per_class = int(
             getattr(self.hc_soinn, "fallback_calibration_samples_per_class", 0)
         )
         atom_gate_calibration_samples_per_class = int(
             getattr(self.hc_soinn, "atom_gate_calibration_samples_per_class", 0)
         )
+        score_bias_calibration_samples_per_class = int(
+            getattr(self.hc_soinn, "score_bias_calibration_samples_per_class", 0)
+        )
         calibration_samples_per_class = max(
             fallback_calibration_samples_per_class if learned_fallback_gate else 0,
             atom_gate_calibration_samples_per_class if learned_atom_gate else 0,
+            score_bias_calibration_samples_per_class if learned_score_bias else 0,
         )
-        if learned_fallback_gate or learned_atom_gate:
+        if learned_fallback_gate or learned_atom_gate or learned_score_bias:
             if train_dataset_for_hc is not None:
                 train_dataset_for_hc, calibration_dataset = get_cached_feature_dataset_split(
                     self.args,
@@ -552,6 +583,23 @@ class Learner(BaseLearner):
                     shuffle=False,
                     num_workers=num_workers,
                 )
+            if calibration_dataset is not None and learned_score_bias:
+                if self._score_bias_calibration_cumulative:
+                    self._score_bias_calibration_datasets.append(calibration_dataset)
+                    if len(self._score_bias_calibration_datasets) == 1:
+                        score_bias_calibration_dataset = self._score_bias_calibration_datasets[0]
+                    else:
+                        score_bias_calibration_dataset = ConcatDataset(
+                            list(self._score_bias_calibration_datasets)
+                        )
+                else:
+                    score_bias_calibration_dataset = calibration_dataset
+                score_bias_calibration_loader = DataLoader(
+                    score_bias_calibration_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                )
         else:
             calibration_dataset = None
         if train_dataset_for_hc is None:
@@ -572,6 +620,8 @@ class Learner(BaseLearner):
             log_feature_cache_loader(fallback_calibration_loader, "fallback_calibration_loader")
         if atom_gate_calibration_loader is not None:
             log_feature_cache_loader(atom_gate_calibration_loader, "atom_gate_calibration_loader")
+        if score_bias_calibration_loader is not None:
+            log_feature_cache_loader(score_bias_calibration_loader, "score_bias_calibration_loader")
 
         if len(self._multiple_gpus) > 1 and self._network is not None:
             logging.info("Using multiple GPUs")
@@ -583,6 +633,7 @@ class Learner(BaseLearner):
             self.train_loader_for_hc,
             fallback_calibration_loader=fallback_calibration_loader,
             atom_gate_calibration_loader=atom_gate_calibration_loader,
+            score_bias_calibration_loader=score_bias_calibration_loader,
         )
 
         if len(self._multiple_gpus) > 1 and self._network is not None:
@@ -595,13 +646,106 @@ class Learner(BaseLearner):
         train_loader_for_hc,
         fallback_calibration_loader=None,
         atom_gate_calibration_loader=None,
+        score_bias_calibration_loader=None,
     ):
         if self._network is not None:
             self._network.to(self._device)
         self._extract_class_features(train_loader_for_hc, self._network)
         self._compress_task_boundary()
+        self._calibrate_score_bias(score_bias_calibration_loader)
         self._calibrate_atom_conflict_gate(atom_gate_calibration_loader)
         self._calibrate_raw_fallback_gate(fallback_calibration_loader)
+
+    def _calibrate_score_bias(self, calibration_loader):
+        if calibration_loader is None:
+            return
+        if not bool(getattr(self.hc_soinn, "use_score_bias_calibration", False)):
+            return
+        boundary = getattr(self.hc_soinn, "known_classes_before_task", None)
+        if boundary is None or int(boundary) <= 0:
+            self.hc_soinn.score_bias_new = 0.0
+            self.hc_soinn._score_bias_fit_stats = {
+                "samples": 0.0,
+                "best_bias": 0.0,
+                "calibration_accuracy": 0.0,
+                "calibration_compact_accuracy": 0.0,
+                "calibration_gain": 0.0,
+                "gate_disabled": 1.0,
+            }
+            return
+
+        grid = tuple(getattr(self.hc_soinn, "score_bias_grid", (0.0,)))
+        if not grid:
+            grid = (0.0,)
+        logging.info(
+            "[LifeTopoDict] Calibrating compact score bias on %d samples (grid=%s).",
+            len(calibration_loader.dataset),
+            ",".join(f"{float(v):.4f}" for v in grid),
+        )
+
+        original_bias = float(getattr(self.hc_soinn, "score_bias_new", 0.0))
+        original_trace = bool(getattr(self.hc_soinn, "enable_prediction_trace", False))
+        self.hc_soinn.enable_prediction_trace = False
+
+        scores = []
+        try:
+            for bias in grid:
+                self.hc_soinn.score_bias_new = float(bias)
+                y_pred, y_true = self._eval_cnn(calibration_loader)
+                if y_pred.shape[0] == 0:
+                    acc = 0.0
+                else:
+                    acc = float(np.mean(y_pred[:, 0] == y_true))
+                scores.append((float(bias), acc))
+        finally:
+            self.hc_soinn.enable_prediction_trace = original_trace
+
+        zero_acc = None
+        for bias, acc in scores:
+            if abs(bias) <= 1e-12:
+                zero_acc = acc
+                break
+        if zero_acc is None:
+            self.hc_soinn.score_bias_new = 0.0
+            y_pred, y_true = self._eval_cnn(calibration_loader)
+            zero_acc = float(np.mean(y_pred[:, 0] == y_true)) if y_pred.shape[0] > 0 else 0.0
+            scores.append((0.0, zero_acc))
+
+        best_bias, best_acc = 0.0, zero_acc
+        for bias, acc in scores:
+            if acc > best_acc + 1e-12 or (
+                abs(acc - best_acc) <= 1e-12 and abs(bias) < abs(best_bias)
+            ):
+                best_bias, best_acc = float(bias), float(acc)
+
+        gain = float(best_acc - zero_acc)
+        disabled = 0.0
+        if gain < float(getattr(self.hc_soinn, "score_bias_min_gain", 0.0)):
+            best_bias = 0.0
+            best_acc = zero_acc
+            gain = 0.0
+            disabled = 1.0
+
+        self.hc_soinn.score_bias_new = float(best_bias)
+        self.hc_soinn._score_bias_fit_stats = {
+            "samples": float(len(calibration_loader.dataset)),
+            "best_bias": float(best_bias),
+            "calibration_accuracy": float(best_acc),
+            "calibration_compact_accuracy": float(zero_acc),
+            "calibration_gain": float(gain),
+            "gate_disabled": float(disabled),
+            "original_bias": float(original_bias),
+        }
+        logging.info(
+            "[LifeTopoDict] Score bias fit: samples=%d, compact_acc=%.4f, "
+            "calib_acc=%.4f, gain=%.4f, bias=%.5f, disabled=%d",
+            int(self.hc_soinn._score_bias_fit_stats["samples"]),
+            float(zero_acc),
+            float(best_acc),
+            float(gain),
+            float(best_bias),
+            int(disabled),
+        )
 
     def _calibrate_atom_conflict_gate(self, calibration_loader):
         if calibration_loader is None:

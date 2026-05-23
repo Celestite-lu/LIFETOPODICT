@@ -60,6 +60,9 @@ def main():
         'atom_gate_strength', 'atom_gate_min_pair_support',
         'atom_gate_smoothing', 'atom_gate_calibration_samples_per_class',
         'atom_gate_calibration_cumulative',
+        'use_score_bias_calibration', 'score_bias_calibration_samples_per_class',
+        'score_bias_calibration_cumulative', 'score_bias_grid',
+        'score_bias_min_gain',
         'use_feature_cache', 'feature_cache_dir', 'feature_cache_strict',
         'feature_cache_dtype', 'feature_cache_skip_backbone',
         'feature_cache_classifier_device',
@@ -215,6 +218,17 @@ def setup_parser():
                         help='Directory for JSONL prediction trace dumps.')
     parser.add_argument('--prediction_trace_dump_all_tasks', type=_str2bool, default=None,
                         help='Dump prediction trace after every eval task when trace output is enabled.')
+
+    parser.add_argument('--use_score_bias_calibration', type=_str2bool, default=None,
+                        help='Fit a calibration split scalar old/new score bias for compact HC-SOINN scores.')
+    parser.add_argument('--score_bias_calibration_samples_per_class', type=int, default=None,
+                        help='Per-class held-out train samples used to fit the score bias scalar.')
+    parser.add_argument('--score_bias_calibration_cumulative', type=_str2bool, default=None,
+                        help='Fit score bias on cumulative held-out calibration samples.')
+    parser.add_argument('--score_bias_grid', type=str, default=None,
+                        help='Comma-separated candidate new-class score biases; lower scores are better.')
+    parser.add_argument('--score_bias_min_gain', type=float, default=None,
+                        help='Minimum calibration accuracy gain required to deploy a nonzero score bias.')
 
     # --- Direction 2: ATD-aware atom conflict gate ---
     parser.add_argument('--use_atom_conflict_gate', type=_str2bool, default=None,

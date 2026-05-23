@@ -104,6 +104,12 @@ _RE_ATOM_CONFLICT_GATE_FIT_LINE = re.compile(
 _RE_ATOM_CONFLICT_GATE_VALUE = re.compile(
     r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
 )
+_RE_SCORE_BIAS_FIT_LINE = re.compile(
+    r'\[LifeTopoDict\] Score bias fit:'
+)
+_RE_SCORE_BIAS_VALUE = re.compile(
+    r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
+)
 _RE_CONFIG_PREFIX = re.compile(
     r'prefix:[ \t]*(.*)'
 )
@@ -358,6 +364,14 @@ def _parse_log_block(log_path: str, content: str, block_index: int) -> Dict[str,
             if parsed is not None:
                 result[f'atom_conflict_gate_{key}'] = parsed
 
+    score_bias_pos = content.rfind('[LifeTopoDict] Score bias fit:')
+    if score_bias_pos >= 0:
+        score_bias_line = content[score_bias_pos:].splitlines()[0]
+        for key, value in _RE_SCORE_BIAS_VALUE.findall(score_bias_line):
+            parsed = _safe_float(value)
+            if parsed is not None:
+                result[f'score_bias_{key}'] = parsed
+
     return result
 
 
@@ -462,6 +476,9 @@ def write_csv(
         'atom_conflict_gate_samples', 'atom_conflict_gate_errors',
         'atom_conflict_gate_gain', 'atom_conflict_gate_gate_rate',
         'atom_conflict_gate_deployed', 'atom_conflict_gate_disabled',
+        'score_bias_samples', 'score_bias_compact_acc',
+        'score_bias_calib_acc', 'score_bias_gain',
+        'score_bias_bias', 'score_bias_disabled',
     ]
 
     all_keys: List[str] = []

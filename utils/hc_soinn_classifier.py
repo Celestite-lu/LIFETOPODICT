@@ -420,6 +420,11 @@ class HCSOINNClassifier:
         atom_gate_min_pair_support: int = 3,
         atom_gate_smoothing: float = 5.0,
         atom_gate_calibration_samples_per_class: int = 0,
+        # --- Score-level old/new calibration ---
+        use_score_bias_calibration: bool = False,
+        score_bias_calibration_samples_per_class: int = 0,
+        score_bias_grid: object = "-0.03,-0.02,-0.015,-0.01,-0.005,0,0.005,0.01,0.015,0.02,0.03",
+        score_bias_min_gain: float = 0.0,
     ) -> None:
         self.max_prototypes_per_class = None if max_prototypes_per_class is None else int(
             max_prototypes_per_class
@@ -574,6 +579,19 @@ class HCSOINNClassifier:
         self.reset_atom_conflict_eval_stats()
 
         # ------------------------------------------------------------------ #
+        # Score-level old/new calibration. This is a BiC-style scalar on top
+        # of the compact HC-SOINN score, fitted only on held-out train data.
+        # ------------------------------------------------------------------ #
+        self.use_score_bias_calibration: bool = bool(use_score_bias_calibration)
+        self.score_bias_calibration_samples_per_class: int = max(
+            0, int(score_bias_calibration_samples_per_class)
+        )
+        self.score_bias_grid: Tuple[float, ...] = self._parse_score_bias_grid(score_bias_grid)
+        self.score_bias_min_gain: float = max(0.0, float(score_bias_min_gain))
+        self.score_bias_new: float = 0.0
+        self._score_bias_fit_stats: Dict[str, float] = {}
+
+        # ------------------------------------------------------------------ #
         # LifeTopoDict: shared dictionary atoms and metadata
         # ------------------------------------------------------------------ #
         # dict_atoms: atom matrix [M, d]; same as dict_atoms_hat (all rows L2-normalised).
@@ -634,6 +652,32 @@ class HCSOINNClassifier:
         self.known_classes_before_task = (
             None if known_classes_before_task is None else int(known_classes_before_task)
         )
+
+    def _apply_score_bias_calibration(
+        self,
+        final_scores: torch.Tensor,
+        valid_classes: List[int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Apply the calibration-fitted current-task class score bias."""
+        if not bool(getattr(self, "use_score_bias_calibration", False)):
+            return final_scores
+        bias = float(getattr(self, "score_bias_new", 0.0))
+        if abs(bias) <= 1e-12:
+            return final_scores
+        boundary = getattr(self, "known_classes_before_task", None)
+        if boundary is None:
+            return final_scores
+        boundary = int(boundary)
+        if boundary <= 0:
+            return final_scores
+        new_mask_np = np.asarray([int(cls) >= boundary for cls in valid_classes], dtype=bool)
+        if not np.any(new_mask_np):
+            return final_scores
+        new_mask_t = torch.from_numpy(new_mask_np).to(device=device, dtype=torch.bool)
+        adjusted = final_scores.clone()
+        adjusted[:, new_mask_t] = adjusted[:, new_mask_t] + bias
+        return adjusted
 
     # ================================================================== #
     # Direction 1: raw-node fallback cache and prediction trace           #
@@ -909,6 +953,15 @@ class HCSOINNClassifier:
             total_bytes += float(len(table) * (4 + 4 + 4))
         return {
             "atom_conflict_gate_model_bytes": total_bytes,
+        }
+
+    def _score_bias_model_bytes(self) -> Dict[str, float]:
+        """Return storage bytes for the score-bias calibration scalar."""
+        total_bytes = 0.0
+        if bool(getattr(self, "use_score_bias_calibration", False)):
+            total_bytes += 8.0
+        return {
+            "score_bias_model_bytes": total_bytes,
         }
 
     def _compute_atom_sharedness(self) -> Dict[int, float]:
@@ -1230,6 +1283,26 @@ class HCSOINNClassifier:
         if not rates:
             rates = [0.002, 0.005, 0.01, 0.02, 0.04]
         return tuple(sorted(set(float(r) for r in rates)))
+
+    @staticmethod
+    def _parse_score_bias_grid(value: object) -> Tuple[float, ...]:
+        if value is None:
+            value = "-0.03,-0.02,-0.015,-0.01,-0.005,0,0.005,0.01,0.015,0.02,0.03"
+        if isinstance(value, (list, tuple)):
+            raw_values = value
+        else:
+            raw_values = str(value).replace(";", ",").split(",")
+        biases: List[float] = []
+        for item in raw_values:
+            try:
+                biases.append(float(item))
+            except (TypeError, ValueError):
+                continue
+        if not biases:
+            biases = [-0.03, -0.02, -0.015, -0.01, -0.005, 0.0, 0.005, 0.01, 0.015, 0.02, 0.03]
+        if not any(abs(b) <= 1e-12 for b in biases):
+            biases.append(0.0)
+        return tuple(sorted(set(float(b) for b in biases)))
 
     @staticmethod
     def _state_one_hot(state: str) -> np.ndarray:
@@ -3353,6 +3426,9 @@ class HCSOINNClassifier:
             atom_gate_storage.get('atom_conflict_gate_model_bytes', 0.0)
         )
         breakdown.update(atom_gate_storage)
+        score_bias_storage = self._score_bias_model_bytes()
+        score_bias_model_bytes = float(score_bias_storage.get('score_bias_model_bytes', 0.0))
+        breakdown.update(score_bias_storage)
 
         if self.use_dict_coding and atom_deployable_bytes > 0.0:
             # Deployable LifeTopoDict storage keeps one atom matrix, sparse
@@ -3379,6 +3455,7 @@ class HCSOINNClassifier:
         if getattr(self, 'fallback_memory_accounting', True):
             compact += raw_fallback_total_bytes + raw_fallback_gate_model_bytes
         compact += atom_conflict_gate_model_bytes
+        compact += score_bias_model_bytes
         breakdown['compact_deployable_bytes'] = compact
 
         # --- Caches (inference predict cache) ---
@@ -3436,6 +3513,7 @@ class HCSOINNClassifier:
             raw_fallback_total_bytes +
             raw_fallback_gate_model_bytes +
             atom_conflict_gate_model_bytes +
+            score_bias_model_bytes +
             cache_bytes +
             buffers_bytes +
             frozen_bytes +
@@ -4802,6 +4880,7 @@ class HCSOINNClassifier:
         if getattr(self, 'use_edge_aware_scoring', False) and 'dist_proto_all' in locals():
             edge_adjustment = self._compute_edge_score_adjustment(dist_proto_all, valid_classes, device)
             final_scores = final_scores + edge_adjustment
+        final_scores = self._apply_score_bias_calibration(final_scores, valid_classes, device)
 
         trace_enabled = bool(
             getattr(self, 'enable_prediction_trace', False)
