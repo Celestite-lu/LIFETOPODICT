@@ -64,6 +64,8 @@ compressed and shared HC-SOINN topology nodes
 
 This means LifeTopoDict should keep using HC-SOINN-style class-local topology nodes as the classifier substrate, compressed through shared dictionary atoms / sparse coefficients. New methods may calibrate, gate, repair, reweight, regularize, or augment this substrate, but must not replace it with an unrelated classifier head as the main method. If a radical architecture is explored, it must be framed as an auxiliary module around the compressed shared-node topology and compared against the unchanged LifeTopoDict base.
 
+Do not make specific designs from Ground Truth labels, test errors, hand-picked task cases, known class identities, or class-order quirks. New mechanisms must come from overall reasoning about HC-SOINN-style class-local topology nodes as a classifier: how nodes represent class-local manifolds, how compression changes topology geometry, how shared atoms affect node reliability, and how incremental tasks shift old/new decision boundaries. Ground Truth may be used only through legitimate training/calibration splits and final evaluation protocols, never as a source of test-specific rules.
+
 Use cached frozen ViT-B/16 features and classifier-only mode unless the experiment explicitly targets feature extraction infrastructure:
 
 ```text
@@ -149,6 +151,8 @@ What is actually new in the LifeTopoDict setting?
 Is the mechanism mathematically and logically coherent under compressed shared HC-SOINN nodes?
 ```
 
+If the local paper summaries are insufficient, the agent may search for additional papers on the web. Prefer primary papers, official proceedings pages, arXiv, and author project pages. Record any outside paper inspiration in the run report so the reasoning can be audited later.
+
 ## Current Research State
 
 Known positive results:
@@ -180,7 +184,9 @@ The agent should prioritize this direction initially, but must not be boxed in b
 3. Read guidance when problems appear. Accuracy collapse, NaN, memory anomalies, unstable calibration, or strange diagnostics require consulting `docs/research_guidance/experiment_guidance.md` before changing code or parameters.
 4. Think beyond the current two directions. Direction 1 and Direction 2 are starting points, not a cage. New architecture ideas are welcome when they keep the compressed shared-node base and come with controls.
 5. Paper-ground every new idea. Before coding a new mechanism, inspect `docs/paper/` for related CIL and dictionary-learning ideas. Use papers to check whether the idea is novel enough, whether the logic is rigorous, and whether the math fits the LifeTopoDict setting.
-6. Prefer mechanism clarity. A small stable gain with a clean, auditable mechanism is better than a fragile large gain that cannot be explained or controlled.
+6. Start from weaknesses and unresolved problems. Innovation should come from diagnosing what the current compressed shared-node topology cannot yet do, where it fails, and which weakness has a plausible mechanism-level fix.
+7. Do not overfit to cases. Avoid designs that are specific to a Ground Truth pattern, a single task case, a fixed class pair, or a known class order. A valid idea should be expressible as a general rule over topology, dictionary, calibration, memory, or incremental-learning structure.
+8. Prefer mechanism clarity. A small stable gain with a clean, auditable mechanism is better than a fragile large gain that cannot be explained or controlled.
 
 ## Setup
 
@@ -537,10 +543,12 @@ is motivated or sanity-checked against docs/paper/
 The agent is encouraged to create new method families beyond the previously drafted directions. Before implementing any new architecture or mechanism, the run report must include:
 
 ```text
+weakness / unresolved problem / improvement opportunity being targeted
 paper/source inspiration
 mechanism sketch
 mathematical scoring or optimization definition
 why it preserves compressed shared HC-SOINN nodes
+why it is not Ground-Truth- or task-case-specific
 expected failure mode
 controls
 ```
