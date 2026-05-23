@@ -122,6 +122,10 @@ class Learner(BaseLearner):
         use_node_residual_penalty = args.get("use_node_residual_penalty", False)
         node_residual_penalty_strength = args.get("node_residual_penalty_strength", 0.0)
         node_residual_penalty_mode = args.get("node_residual_penalty_mode", "linear")
+        use_class_score_normalization = args.get("use_class_score_normalization", False)
+        class_score_norm_mode = args.get("class_score_norm_mode", "affine")
+        class_score_norm_strength = args.get("class_score_norm_strength", 1.0)
+        class_score_norm_min_scale = args.get("class_score_norm_min_scale", 0.01)
 
         # --- Ablation switches. Growth and additive edge-aware scoring are
         # kept for historical reproducibility only; future experiments keep
@@ -210,6 +214,10 @@ class Learner(BaseLearner):
             use_node_residual_penalty=use_node_residual_penalty,
             node_residual_penalty_strength=node_residual_penalty_strength,
             node_residual_penalty_mode=node_residual_penalty_mode,
+            use_class_score_normalization=use_class_score_normalization,
+            class_score_norm_mode=class_score_norm_mode,
+            class_score_norm_strength=class_score_norm_strength,
+            class_score_norm_min_scale=class_score_norm_min_scale,
         )
 
         # --- P0-4: Apply ablation switches (override defaults from HCSOINNClassifier) ---
@@ -298,6 +306,10 @@ class Learner(BaseLearner):
             f"use_node_residual_penalty={use_node_residual_penalty}, "
             f"node_residual_penalty_strength={node_residual_penalty_strength}, "
             f"node_residual_penalty_mode={node_residual_penalty_mode}, "
+            f"use_class_score_normalization={use_class_score_normalization}, "
+            f"class_score_norm_mode={class_score_norm_mode}, "
+            f"class_score_norm_strength={class_score_norm_strength}, "
+            f"class_score_norm_min_scale={class_score_norm_min_scale}, "
             f"enable_prediction_trace={enable_prediction_trace}, "
             f"trace_split={trace_split}, "
             f"prediction_trace_output_dir={self._prediction_trace_output_dir}, "
@@ -339,6 +351,7 @@ class Learner(BaseLearner):
             f"score_bias={mem.get('score_bias_model_mb', 0):.4f} MB, "
             f"residual_penalty={mem.get('node_residual_penalty_model_mb', 0):.4f} MB, "
             f"raw_aux={mem.get('raw_auxiliary_model_mb', 0):.4f} MB, "
+            f"class_score_norm={mem.get('class_score_normalization_model_mb', 0):.4f} MB, "
             f"caches={mem.get('caches_mb', 0):.4f} MB, "
             f"buffers={mem.get('buffers_mb', 0):.4f} MB, "
             f"frozen={mem.get('frozen_mb', 0):.4f} MB"
@@ -428,6 +441,17 @@ class Learner(BaseLearner):
                 f"harm_sel={atom_gate_stats.get('calibration_harm_selected', 0):.0f}, "
                 f"disabled={int(atom_gate_stats.get('gate_disabled', 0))}"
             )
+        class_score_norm_stats = diag.get('class_score_normalization_stats', {})
+        if class_score_norm_stats:
+            logging.info(
+                f"[LifeTopoDict] Class score norm: enabled={int(class_score_norm_stats.get('enabled', 0))}, "
+                f"stored={int(class_score_norm_stats.get('stored_classes', 0))}, "
+                f"fitted={int(class_score_norm_stats.get('fitted_classes', 0))}, "
+                f"samples={int(class_score_norm_stats.get('samples', 0))}, "
+                f"ref_center={class_score_norm_stats.get('ref_center', 0):.6f}, "
+                f"ref_scale={class_score_norm_stats.get('ref_scale', 0):.6f}, "
+                f"strength={class_score_norm_stats.get('strength', 0):.3f}"
+            )
         if edge_stats:
             logging.info(
                 f"[LifeTopoDict] Edge scoring: use_rate={edge_stats.get('edge_use_rate', 0):.4f}, "
@@ -466,13 +490,14 @@ class Learner(BaseLearner):
                 lbs.append(label.cpu())
 
         if len(feats) == 0:
-            return
+            return None
         feats = torch.cat(feats, dim=0).numpy()
         lbs = torch.cat(lbs, dim=0).numpy()
         self.hc_soinn.add_features(feats, lbs)
 
         proto_info = self.hc_soinn.prototypes_per_class()
         logging.info(f"[LifeTopoDict] prototypes per class: {proto_info}")
+        return feats, lbs
 
     # ------------------------------------------------------------------ #
     # Incremental training                                                #
@@ -686,11 +711,22 @@ class Learner(BaseLearner):
     ):
         if self._network is not None:
             self._network.to(self._device)
-        self._extract_class_features(train_loader_for_hc, self._network)
+        class_feature_data = self._extract_class_features(train_loader_for_hc, self._network)
         self._compress_task_boundary()
+        self._fit_class_score_normalization(class_feature_data)
         self._calibrate_score_bias(score_bias_calibration_loader)
         self._calibrate_atom_conflict_gate(atom_gate_calibration_loader)
         self._calibrate_raw_fallback_gate(fallback_calibration_loader)
+
+    def _fit_class_score_normalization(self, class_feature_data):
+        if not bool(getattr(self.hc_soinn, "use_class_score_normalization", False)):
+            return
+        if class_feature_data is None:
+            logging.warning("[LifeTopoDict] Class score normalization skipped: no train features.")
+            return
+        feats, labels = class_feature_data
+        if hasattr(self.hc_soinn, "fit_class_score_normalization"):
+            self.hc_soinn.fit_class_score_normalization(feats, labels)
 
     def _calibrate_score_bias(self, calibration_loader):
         if calibration_loader is None:

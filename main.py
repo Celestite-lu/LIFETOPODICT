@@ -67,6 +67,8 @@ def main():
         'score_bias_min_gain',
         'use_node_residual_penalty', 'node_residual_penalty_strength',
         'node_residual_penalty_mode',
+        'use_class_score_normalization', 'class_score_norm_mode',
+        'class_score_norm_strength', 'class_score_norm_min_scale',
         'use_feature_cache', 'feature_cache_dir', 'feature_cache_strict',
         'feature_cache_dtype', 'feature_cache_skip_backbone',
         'feature_cache_classifier_device',
@@ -245,6 +247,14 @@ def setup_parser():
                         help='Strength for node residual distance penalty.')
     parser.add_argument('--node_residual_penalty_mode', type=str, default=None,
                         help='Node residual penalty mode: linear, sqrt, or random_control.')
+    parser.add_argument('--use_class_score_normalization', type=_str2bool, default=None,
+                        help='Normalize compact HC-SOINN scores with train-only per-class distance stats.')
+    parser.add_argument('--class_score_norm_mode', type=str, default=None,
+                        help='Class score normalization mode: affine, scale, or shift.')
+    parser.add_argument('--class_score_norm_strength', type=float, default=None,
+                        help='Interpolation strength for class score normalization.')
+    parser.add_argument('--class_score_norm_min_scale', type=float, default=None,
+                        help='Minimum positive-score scale used by class score normalization.')
 
     # --- Direction 2: ATD-aware atom conflict gate ---
     parser.add_argument('--use_atom_conflict_gate', type=_str2bool, default=None,

@@ -432,6 +432,11 @@ class HCSOINNClassifier:
         use_node_residual_penalty: bool = False,
         node_residual_penalty_strength: float = 0.0,
         node_residual_penalty_mode: str = "linear",
+        # --- Compact score normalization ---
+        use_class_score_normalization: bool = False,
+        class_score_norm_mode: str = "affine",
+        class_score_norm_strength: float = 1.0,
+        class_score_norm_min_scale: float = 0.01,
     ) -> None:
         self.max_prototypes_per_class = None if max_prototypes_per_class is None else int(
             max_prototypes_per_class
@@ -612,6 +617,25 @@ class HCSOINNClassifier:
         self.node_residual_penalty_mode: str = str(node_residual_penalty_mode).lower()
 
         # ------------------------------------------------------------------ #
+        # Class-wise compact score normalization. This stores robust positive
+        # score statistics fitted from train features after compression.
+        # ------------------------------------------------------------------ #
+        self.use_class_score_normalization: bool = bool(use_class_score_normalization)
+        self.class_score_norm_mode: str = str(class_score_norm_mode).lower()
+        self.class_score_norm_strength: float = min(
+            1.0, max(0.0, float(class_score_norm_strength))
+        )
+        self.class_score_norm_min_scale: float = max(
+            1e-6, float(class_score_norm_min_scale)
+        )
+        self.class_score_norm_center: Dict[int, float] = {}
+        self.class_score_norm_scale: Dict[int, float] = {}
+        self.class_score_norm_samples: Dict[int, int] = {}
+        self.class_score_norm_ref_center: float = 0.0
+        self.class_score_norm_ref_scale: float = 1.0
+        self._class_score_norm_fit_stats: Dict[str, float] = {}
+
+        # ------------------------------------------------------------------ #
         # LifeTopoDict: shared dictionary atoms and metadata
         # ------------------------------------------------------------------ #
         # dict_atoms: atom matrix [M, d]; same as dict_atoms_hat (all rows L2-normalised).
@@ -720,6 +744,196 @@ class HCSOINNClassifier:
         else:
             values = torch.clamp(residual_t, min=0.0)
         return values * strength
+
+    def _node_residual_penalty_numpy(self, residuals: np.ndarray) -> np.ndarray:
+        """Numpy counterpart of node residual penalties for train-time fitting."""
+        strength = float(getattr(self, "node_residual_penalty_strength", 0.0))
+        residuals = np.asarray(residuals, dtype=np.float32)
+        if not bool(getattr(self, "use_node_residual_penalty", False)) or abs(strength) <= 1e-12:
+            return np.zeros_like(residuals, dtype=np.float32)
+        mode = str(getattr(self, "node_residual_penalty_mode", "linear")).lower()
+        clipped = np.maximum(residuals, 0.0)
+        if mode in ("sqrt", "root"):
+            values = np.sqrt(clipped)
+        elif mode in ("random", "random_control"):
+            idx = np.arange(residuals.size, dtype=np.float32)
+            values = np.remainder(np.sin((idx + 1.0) * 12.9898) * 43758.5453, 1.0)
+            values = values.astype(np.float32, copy=False) * float(np.mean(clipped) if clipped.size else 0.0)
+        else:
+            values = clipped
+        return (values * strength).astype(np.float32, copy=False)
+
+    def _positive_compact_scores_for_class(
+        self,
+        features: np.ndarray,
+        cls: int,
+    ) -> np.ndarray:
+        """Return own-class compact fused distances for train-only stats."""
+        if int(cls) not in self.class_mu:
+            return np.empty((0,), dtype=np.float32)
+        feats = np.asarray(features, dtype=np.float32)
+        if feats.ndim != 2 or feats.shape[0] == 0:
+            return np.empty((0,), dtype=np.float32)
+        mu = np.asarray(self.class_mu[int(cls)], dtype=np.float32)
+        if mu.ndim != 1 or mu.shape[0] != feats.shape[1]:
+            return np.empty((0,), dtype=np.float32)
+
+        q_norm = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
+        mu_norm = mu / (np.linalg.norm(mu) + 1e-8)
+        dist_ncm = 1.0 - np.matmul(q_norm, mu_norm.reshape(-1, 1)).reshape(-1)
+
+        clusters = self.class_clusters.get(int(cls), [])
+        active_centers: List[np.ndarray] = []
+        active_residuals: List[float] = []
+        if clusters:
+            cls_node_states = self.node_states.get(int(cls), [])
+            for idx, node in enumerate(clusters):
+                center = getattr(node, "center", None)
+                if not isinstance(center, np.ndarray) or center.shape[0] != feats.shape[1]:
+                    continue
+                state = cls_node_states[idx] if idx < len(cls_node_states) else getattr(node, "node_state", "plastic")
+                if getattr(self, "use_dict_coding", False) and state == "inactive":
+                    continue
+                active_centers.append(center.astype(np.float32, copy=False))
+                active_residuals.append(float(getattr(node, "residual", 0.0)))
+
+        if not active_centers:
+            dist_sub = dist_ncm.copy()
+        else:
+            protos = np.stack(active_centers, axis=0).astype(np.float32, copy=False)
+            protos = protos / (np.linalg.norm(protos, axis=1, keepdims=True) + 1e-8)
+            proto_dist = 1.0 - np.matmul(q_norm, protos.T)
+            penalties = self._node_residual_penalty_numpy(
+                np.asarray(active_residuals, dtype=np.float32)
+            )
+            if penalties.size:
+                proto_dist = proto_dist + penalties.reshape(1, -1)
+            dist_sub = np.min(proto_dist, axis=1)
+
+        scores = self.alpha * dist_ncm + (1.0 - self.alpha) * dist_sub
+        return scores.astype(np.float32, copy=False)
+
+    def fit_class_score_normalization(
+        self,
+        features: np.ndarray,
+        labels: np.ndarray,
+    ) -> Dict[str, float]:
+        """Fit per-class compact distance center/scale from train features only."""
+        if not bool(getattr(self, "use_class_score_normalization", False)):
+            return {}
+        feats = np.asarray(features, dtype=np.float32)
+        labs = np.asarray(labels).reshape(-1)
+        if feats.ndim != 2 or labs.shape[0] != feats.shape[0] or feats.shape[0] == 0:
+            self._class_score_norm_fit_stats = {
+                "enabled": 1.0,
+                "fitted_classes": 0.0,
+                "samples": 0.0,
+            }
+            return dict(self._class_score_norm_fit_stats)
+
+        fitted = 0
+        sample_count = 0
+        score_mean_sum = 0.0
+        scale_sum = 0.0
+        min_scale = float(getattr(self, "class_score_norm_min_scale", 0.01))
+
+        for cls_raw in sorted(np.unique(labs).tolist()):
+            cls = int(cls_raw)
+            mask = labs == cls
+            cls_scores = self._positive_compact_scores_for_class(feats[mask], cls)
+            cls_scores = cls_scores[np.isfinite(cls_scores)]
+            if cls_scores.size == 0:
+                continue
+            center = float(np.median(cls_scores))
+            q25 = float(np.quantile(cls_scores, 0.25))
+            q75 = float(np.quantile(cls_scores, 0.75))
+            robust_scale = (q75 - q25) / 1.349 if q75 > q25 else 0.0
+            std_scale = float(np.std(cls_scores))
+            scale = max(min_scale, robust_scale, 0.5 * std_scale)
+            self.class_score_norm_center[cls] = center
+            self.class_score_norm_scale[cls] = scale
+            self.class_score_norm_samples[cls] = int(cls_scores.size)
+            fitted += 1
+            sample_count += int(cls_scores.size)
+            score_mean_sum += float(np.mean(cls_scores))
+            scale_sum += scale
+
+        all_centers = np.asarray(list(self.class_score_norm_center.values()), dtype=np.float32)
+        all_scales = np.asarray(list(self.class_score_norm_scale.values()), dtype=np.float32)
+        if all_centers.size > 0:
+            self.class_score_norm_ref_center = float(np.median(all_centers))
+        if all_scales.size > 0:
+            self.class_score_norm_ref_scale = float(
+                max(min_scale, np.median(all_scales))
+            )
+
+        self._class_score_norm_fit_stats = {
+            "enabled": 1.0,
+            "fitted_classes": float(fitted),
+            "stored_classes": float(len(self.class_score_norm_center)),
+            "samples": float(sample_count),
+            "score_mean": float(score_mean_sum / max(1, fitted)),
+            "scale_mean": float(scale_sum / max(1, fitted)),
+            "ref_center": float(self.class_score_norm_ref_center),
+            "ref_scale": float(self.class_score_norm_ref_scale),
+            "strength": float(getattr(self, "class_score_norm_strength", 0.0)),
+        }
+        logging.info(
+            "[ClassScoreNorm] fitted=%d stored=%d samples=%d ref_center=%.6f ref_scale=%.6f mode=%s strength=%.3f",
+            fitted,
+            len(self.class_score_norm_center),
+            sample_count,
+            self.class_score_norm_ref_center,
+            self.class_score_norm_ref_scale,
+            self.class_score_norm_mode,
+            self.class_score_norm_strength,
+        )
+        return dict(self._class_score_norm_fit_stats)
+
+    def _apply_class_score_normalization(
+        self,
+        final_scores: torch.Tensor,
+        valid_classes: List[int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Normalize compact class distances using train-only positive stats."""
+        if not bool(getattr(self, "use_class_score_normalization", False)):
+            return final_scores
+        if not self.class_score_norm_center or final_scores.numel() == 0:
+            return final_scores
+
+        ref_center = float(getattr(self, "class_score_norm_ref_center", 0.0))
+        ref_scale = float(getattr(self, "class_score_norm_ref_scale", 1.0))
+        min_scale = float(getattr(self, "class_score_norm_min_scale", 0.01))
+        strength = float(getattr(self, "class_score_norm_strength", 1.0))
+        if strength <= 1e-12 or ref_scale <= 0.0:
+            return final_scores
+
+        centers_np = np.asarray(
+            [self.class_score_norm_center.get(int(cls), ref_center) for cls in valid_classes],
+            dtype=np.float32,
+        )
+        scales_np = np.asarray(
+            [self.class_score_norm_scale.get(int(cls), ref_scale) for cls in valid_classes],
+            dtype=np.float32,
+        )
+        scales_np = np.maximum(scales_np, min_scale)
+        centers_t = torch.from_numpy(centers_np).to(device=device, dtype=final_scores.dtype)
+        scales_t = torch.from_numpy(scales_np).to(device=device, dtype=final_scores.dtype)
+        ratio_t = torch.as_tensor(ref_scale, device=device, dtype=final_scores.dtype) / scales_t
+        ref_center_t = torch.as_tensor(ref_center, device=device, dtype=final_scores.dtype)
+
+        mode = str(getattr(self, "class_score_norm_mode", "affine")).lower()
+        if mode in ("scale", "scale_only"):
+            normalized = final_scores * ratio_t.view(1, -1)
+        elif mode in ("shift", "center", "shift_only"):
+            normalized = final_scores - centers_t.view(1, -1) + ref_center_t
+        else:
+            normalized = ref_center_t + (final_scores - centers_t.view(1, -1)) * ratio_t.view(1, -1)
+
+        if strength >= 1.0 - 1e-12:
+            return normalized
+        return (1.0 - strength) * final_scores + strength * normalized
 
     # ================================================================== #
     # Direction 1: raw-node fallback cache and prediction trace           #
@@ -1034,6 +1248,19 @@ class HCSOINNClassifier:
             total_bytes += 8.0
         return {
             "raw_auxiliary_model_bytes": total_bytes,
+        }
+
+    def _class_score_normalization_model_bytes(self) -> Dict[str, float]:
+        """Return storage bytes for class-wise score normalization tables."""
+        total_bytes = 0.0
+        if bool(getattr(self, "use_class_score_normalization", False)):
+            n_classes = len(getattr(self, "class_score_norm_center", {}) or {})
+            # Per class: class id, center, scale, and sample-count metadata.
+            total_bytes += float(n_classes * (4 + 4 + 4 + 4))
+            # Global deployable scalars: ref center/scale, strength, scale floor.
+            total_bytes += 8.0 * 4.0
+        return {
+            "class_score_normalization_model_bytes": total_bytes,
         }
 
     def _compute_atom_sharedness(self) -> Dict[int, float]:
@@ -3547,6 +3774,11 @@ class HCSOINNClassifier:
             raw_auxiliary_storage.get('raw_auxiliary_model_bytes', 0.0)
         )
         breakdown.update(raw_auxiliary_storage)
+        class_score_norm_storage = self._class_score_normalization_model_bytes()
+        class_score_normalization_model_bytes = float(
+            class_score_norm_storage.get('class_score_normalization_model_bytes', 0.0)
+        )
+        breakdown.update(class_score_norm_storage)
 
         if self.use_dict_coding and atom_deployable_bytes > 0.0:
             # Deployable LifeTopoDict storage keeps one atom matrix, sparse
@@ -3576,6 +3808,7 @@ class HCSOINNClassifier:
         compact += score_bias_model_bytes
         compact += node_residual_penalty_model_bytes
         compact += raw_auxiliary_model_bytes
+        compact += class_score_normalization_model_bytes
         breakdown['compact_deployable_bytes'] = compact
 
         # --- Caches (inference predict cache) ---
@@ -3636,6 +3869,7 @@ class HCSOINNClassifier:
             score_bias_model_bytes +
             node_residual_penalty_model_bytes +
             raw_auxiliary_model_bytes +
+            class_score_normalization_model_bytes +
             cache_bytes +
             buffers_bytes +
             frozen_bytes +
@@ -3705,6 +3939,7 @@ class HCSOINNClassifier:
         fallback_gate_stats = dict(getattr(self, '_raw_fallback_gate_fit_stats', {}))
         atom_gate_stats = dict(getattr(self, '_atom_conflict_gate_fit_stats', {}))
         atom_eval_stats = dict(getattr(self, '_atom_conflict_eval_stats', {}))
+        class_score_norm_stats = dict(getattr(self, '_class_score_norm_fit_stats', {}))
         if atom_gate_stats:
             samples_eval = float(atom_eval_stats.get('samples', 0.0))
             if samples_eval > 0.0:
@@ -3743,6 +3978,7 @@ class HCSOINNClassifier:
             'raw_auxiliary_stats': raw_auxiliary_stats,
             'raw_fallback_gate_stats': fallback_gate_stats,
             'atom_conflict_gate_stats': atom_gate_stats,
+            'class_score_normalization_stats': class_score_norm_stats,
         }
 
         logging.info(
@@ -5031,6 +5267,7 @@ class HCSOINNClassifier:
             edge_adjustment = self._compute_edge_score_adjustment(dist_proto_all, valid_classes, device)
             final_scores = final_scores + edge_adjustment
         final_scores = self._apply_score_bias_calibration(final_scores, valid_classes, device)
+        final_scores = self._apply_class_score_normalization(final_scores, valid_classes, device)
         compact_scores_for_trace = final_scores
 
         if bool(getattr(self, "use_raw_auxiliary_nodes", False)) and getattr(self, "raw_fallback_per_class", 0) > 0:
@@ -5092,6 +5329,7 @@ class HCSOINNClassifier:
                 if edge_adjustment is not None:
                     aux_scores = aux_scores + edge_adjustment
                 final_scores = self._apply_score_bias_calibration(aux_scores, valid_classes, device)
+                final_scores = self._apply_class_score_normalization(final_scores, valid_classes, device)
                 if stage_aux_t0 is not None:
                     self._profile_toc("raw_auxiliary_nodes", stage_aux_t0, device)
 
@@ -5895,6 +6133,7 @@ class HCSOINNClassifier:
                     dist_sub[:, i] = dist_ncm[:, i]
 
         final_scores = self.alpha * dist_ncm + (1.0 - self.alpha) * dist_sub  # lower is better
+        final_scores = self._apply_class_score_normalization(final_scores, valid_classes, device)
         valid_class_ids = torch.tensor(valid_classes, device=device, dtype=torch.long)
         full_logits[:, valid_class_ids] = -final_scores
         return full_logits
