@@ -58,6 +58,7 @@
     "fallback_memory_accounting": true,
     "use_raw_auxiliary_nodes": true,
     "raw_auxiliary_penalty": 0.02,
+    "raw_auxiliary_scope": "all",
     "enable_prediction_trace": true,
     "trace_split": "test",
     "use_feature_cache": true,

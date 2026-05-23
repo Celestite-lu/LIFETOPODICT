@@ -410,6 +410,7 @@ class HCSOINNClassifier:
         fallback_node_table_lambda: float = 0.5,
         use_raw_auxiliary_nodes: bool = False,
         raw_auxiliary_penalty: float = 0.0,
+        raw_auxiliary_scope: str = "all",
         enable_prediction_trace: bool = False,
         trace_split: str = "test",
         fallback_random_seed: int = 0,
@@ -551,7 +552,8 @@ class HCSOINNClassifier:
         self.fallback_pair_table_lambda: float = float(fallback_pair_table_lambda)
         self.fallback_node_table_lambda: float = float(fallback_node_table_lambda)
         self.use_raw_auxiliary_nodes: bool = bool(use_raw_auxiliary_nodes)
-        self.raw_auxiliary_penalty: float = max(0.0, float(raw_auxiliary_penalty))
+        self.raw_auxiliary_penalty: float = float(raw_auxiliary_penalty)
+        self.raw_auxiliary_scope: str = str(raw_auxiliary_scope).lower()
         self.enable_prediction_trace: bool = bool(enable_prediction_trace)
         self.trace_split: str = str(trace_split)
         self._raw_fallback_rng = np.random.RandomState(int(fallback_random_seed))
@@ -2681,6 +2683,7 @@ class HCSOINNClassifier:
         out = {
             "raw_auxiliary_enabled": float(bool(getattr(self, "use_raw_auxiliary_nodes", False))),
             "raw_auxiliary_penalty": float(getattr(self, "raw_auxiliary_penalty", 0.0)),
+            "raw_auxiliary_scope": str(getattr(self, "raw_auxiliary_scope", "all")),
             "raw_auxiliary_cache_nodes": float(nodes),
             "raw_auxiliary_cache_classes": float(classes),
             "raw_auxiliary_samples": samples,
@@ -5063,6 +5066,26 @@ class HCSOINNClassifier:
                         if mask.any():
                             min_d, _ = dist_aux_all[:, mask].min(dim=1)
                             dist_aux[:, ci] = min_d
+                scope = str(getattr(self, "raw_auxiliary_scope", "all")).lower()
+                if scope in ("old", "new"):
+                    boundary = getattr(self, "known_classes_before_task", None)
+                    boundary = 0 if boundary is None else int(boundary)
+                    allowed = np.asarray(
+                        [
+                            (int(cls) < boundary) if scope == "old" else (int(cls) >= boundary)
+                            for cls in valid_classes
+                        ],
+                        dtype=bool,
+                    )
+                    if not np.any(allowed):
+                        dist_aux = torch.full_like(dist_aux, float("inf"))
+                    else:
+                        allowed_t = torch.from_numpy(allowed).to(device=device, dtype=torch.bool)
+                        dist_aux = torch.where(
+                            allowed_t.view(1, -1),
+                            dist_aux,
+                            torch.full_like(dist_aux, float("inf")),
+                        )
                 raw_auxiliary_available_np = torch.isfinite(dist_aux).any(dim=1).detach().cpu().numpy()
                 dist_sub_aux = torch.minimum(dist_sub, dist_aux)
                 aux_scores = self.alpha * dist_ncm + (1.0 - self.alpha) * dist_sub_aux
@@ -5751,6 +5774,7 @@ class HCSOINNClassifier:
                         "atom_conflict_used": bool(trace_info["atom_conflict_gate"][row]),
                         "raw_auxiliary_available": bool(trace_info["raw_auxiliary_available"][row]),
                         "raw_auxiliary_penalty": float(getattr(self, "raw_auxiliary_penalty", 0.0)),
+                        "raw_auxiliary_scope": str(getattr(self, "raw_auxiliary_scope", "all")),
                         "fallback_available": bool(fallback_available[row]),
                         "fallback_used": bool(fallback_gate[row]),
                         "fallback_top1": int(fallback_pred[row]),

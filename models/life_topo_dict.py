@@ -95,6 +95,7 @@ class Learner(BaseLearner):
         fallback_node_table_lambda = args.get("fallback_node_table_lambda", 0.5)
         use_raw_auxiliary_nodes = args.get("use_raw_auxiliary_nodes", False)
         raw_auxiliary_penalty = args.get("raw_auxiliary_penalty", 0.0)
+        raw_auxiliary_scope = args.get("raw_auxiliary_scope", "all")
         enable_prediction_trace = args.get("enable_prediction_trace", False)
         trace_split = args.get("trace_split", "test")
         use_atom_conflict_gate = args.get("use_atom_conflict_gate", False)
@@ -190,6 +191,7 @@ class Learner(BaseLearner):
             fallback_node_table_lambda=fallback_node_table_lambda,
             use_raw_auxiliary_nodes=use_raw_auxiliary_nodes,
             raw_auxiliary_penalty=raw_auxiliary_penalty,
+            raw_auxiliary_scope=raw_auxiliary_scope,
             enable_prediction_trace=enable_prediction_trace,
             trace_split=trace_split,
             fallback_random_seed=args.get("fallback_random_seed", args.get("seed", 0)),
@@ -278,6 +280,7 @@ class Learner(BaseLearner):
             f"fallback_node_table_lambda={fallback_node_table_lambda}, "
             f"use_raw_auxiliary_nodes={use_raw_auxiliary_nodes}, "
             f"raw_auxiliary_penalty={raw_auxiliary_penalty}, "
+            f"raw_auxiliary_scope={raw_auxiliary_scope}, "
             f"use_atom_conflict_gate={use_atom_conflict_gate}, "
             f"atom_conflict_metric={atom_conflict_metric}, "
             f"atom_conflict_target={atom_conflict_target}, "
@@ -373,6 +376,7 @@ class Learner(BaseLearner):
             logging.info(
                 f"[LifeTopoDict] Raw auxiliary: enabled={int(raw_auxiliary_stats.get('raw_auxiliary_enabled', 0))}, "
                 f"penalty={raw_auxiliary_stats.get('raw_auxiliary_penalty', 0):.4f}, "
+                f"scope={raw_auxiliary_stats.get('raw_auxiliary_scope', 'all')}, "
                 f"cache_nodes={int(raw_auxiliary_stats.get('raw_auxiliary_cache_nodes', 0))}, "
                 f"cache_classes={int(raw_auxiliary_stats.get('raw_auxiliary_cache_classes', 0))}, "
                 f"available={raw_auxiliary_stats.get('raw_auxiliary_available_rate', 0):.4f}, "
