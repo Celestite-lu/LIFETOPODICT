@@ -270,6 +270,8 @@ EXP_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
 The working tree should be clean except for ignored logs/results. If tracked files are dirty, inspect them before starting; do not overwrite unknown user edits.
 
+Untracked files that were not created by the current experiment are not a reason to stop. Leave them untouched unless the experiment explicitly owns them. Never use `git add .` in autonomous experiments; always add explicit paths.
+
 After implementing an idea:
 
 ```bash
@@ -363,6 +365,12 @@ LOOP FOREVER until interrupted by the user.
 
 ```bash
 git status --short
+
+# Tracked dirty files require inspection before starting. Untracked unrelated
+# files may be left alone.
+git diff --stat
+git diff --cached --stat
+
 EXP_START=$(git rev-parse HEAD)
 EXP_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 ```
@@ -473,7 +481,7 @@ done
     - keep successful code/config/report commits;
     - for successful follow-up docs/config updates, create a follow-up commit;
     - push kept commits with `git push origin "$EXP_BRANCH"`;
-    - for failed experimental code with no reusable value, run `git reset --hard "$EXP_START"` after recording the result;
+    - for failed experimental code with no reusable value, run `git reset --hard "$EXP_START"` after recording the result, before any push;
     - for useful failed infrastructure, keep the commit but mark the method as `diagnostic`.
 16. If git is not available:
     - keep useful code/config changes;
