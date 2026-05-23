@@ -119,6 +119,18 @@ class Learner(BaseLearner):
             "-0.03,-0.02,-0.015,-0.01,-0.005,0,0.005,0.01,0.015,0.02,0.03",
         )
         score_bias_min_gain = args.get("score_bias_min_gain", 0.0)
+        use_pair_margin_calibration = args.get("use_pair_margin_calibration", False)
+        pair_margin_calibration_samples_per_class = args.get(
+            "pair_margin_calibration_samples_per_class", 0
+        )
+        pair_margin_calibration_cumulative = args.get("pair_margin_calibration_cumulative", True)
+        pair_margin_topk = args.get("pair_margin_topk", 80)
+        pair_margin_strength = args.get("pair_margin_strength", 0.02)
+        pair_margin_min_support = args.get("pair_margin_min_support", 2)
+        pair_margin_smoothing = args.get("pair_margin_smoothing", 5.0)
+        pair_margin_max_margin = args.get("pair_margin_max_margin", 0.08)
+        pair_margin_mode = args.get("pair_margin_mode", "utility")
+        pair_margin_min_gain = args.get("pair_margin_min_gain", 0.0)
         use_node_residual_penalty = args.get("use_node_residual_penalty", False)
         node_residual_penalty_strength = args.get("node_residual_penalty_strength", 0.0)
         node_residual_penalty_mode = args.get("node_residual_penalty_mode", "linear")
@@ -218,6 +230,15 @@ class Learner(BaseLearner):
             score_bias_calibration_samples_per_class=score_bias_calibration_samples_per_class,
             score_bias_grid=score_bias_grid,
             score_bias_min_gain=score_bias_min_gain,
+            use_pair_margin_calibration=use_pair_margin_calibration,
+            pair_margin_calibration_samples_per_class=pair_margin_calibration_samples_per_class,
+            pair_margin_topk=pair_margin_topk,
+            pair_margin_strength=pair_margin_strength,
+            pair_margin_min_support=pair_margin_min_support,
+            pair_margin_smoothing=pair_margin_smoothing,
+            pair_margin_max_margin=pair_margin_max_margin,
+            pair_margin_mode=pair_margin_mode,
+            pair_margin_min_gain=pair_margin_min_gain,
             use_node_residual_penalty=use_node_residual_penalty,
             node_residual_penalty_strength=node_residual_penalty_strength,
             node_residual_penalty_mode=node_residual_penalty_mode,
@@ -249,6 +270,8 @@ class Learner(BaseLearner):
         self._atom_gate_calibration_datasets = []
         self._score_bias_calibration_cumulative = bool(score_bias_calibration_cumulative)
         self._score_bias_calibration_datasets = []
+        self._pair_margin_calibration_cumulative = bool(pair_margin_calibration_cumulative)
+        self._pair_margin_calibration_datasets = []
         self._prediction_trace_output_dir = args.get("prediction_trace_output_dir", None)
         self._prediction_trace_dump_all_tasks = bool(
             args.get("prediction_trace_dump_all_tasks", True)
@@ -317,6 +340,16 @@ class Learner(BaseLearner):
             f"score_bias_calibration_cumulative={score_bias_calibration_cumulative}, "
             f"score_bias_grid={score_bias_grid}, "
             f"score_bias_min_gain={score_bias_min_gain}, "
+            f"use_pair_margin_calibration={use_pair_margin_calibration}, "
+            f"pair_margin_calibration_samples_per_class={pair_margin_calibration_samples_per_class}, "
+            f"pair_margin_calibration_cumulative={pair_margin_calibration_cumulative}, "
+            f"pair_margin_topk={pair_margin_topk}, "
+            f"pair_margin_strength={pair_margin_strength}, "
+            f"pair_margin_min_support={pair_margin_min_support}, "
+            f"pair_margin_smoothing={pair_margin_smoothing}, "
+            f"pair_margin_max_margin={pair_margin_max_margin}, "
+            f"pair_margin_mode={pair_margin_mode}, "
+            f"pair_margin_min_gain={pair_margin_min_gain}, "
             f"use_node_residual_penalty={use_node_residual_penalty}, "
             f"node_residual_penalty_strength={node_residual_penalty_strength}, "
             f"node_residual_penalty_mode={node_residual_penalty_mode}, "
@@ -370,6 +403,7 @@ class Learner(BaseLearner):
             f"fallback_gate={mem.get('raw_fallback_gate_model_mb', 0):.4f} MB, "
             f"atom_gate={mem.get('atom_conflict_gate_model_mb', 0):.4f} MB, "
             f"score_bias={mem.get('score_bias_model_mb', 0):.4f} MB, "
+            f"pair_margin={mem.get('pair_margin_model_mb', 0):.4f} MB, "
             f"residual_penalty={mem.get('node_residual_penalty_model_mb', 0):.4f} MB, "
             f"residual_repair={mem.get('node_residual_repair_model_mb', 0):.4f} MB, "
             f"raw_aux={mem.get('raw_auxiliary_model_mb', 0):.4f} MB, "
@@ -487,6 +521,27 @@ class Learner(BaseLearner):
                 f"ref_scale={class_score_norm_stats.get('ref_scale', 0):.6f}, "
                 f"strength={class_score_norm_stats.get('strength', 0):.3f}"
             )
+        pair_margin_stats = diag.get('pair_margin_stats', {})
+        if pair_margin_stats:
+            logging.info(
+                f"[LifeTopoDict] Pair margin fit: enabled={int(pair_margin_stats.get('enabled', 0))}, "
+                f"samples={int(pair_margin_stats.get('samples', 0))}, "
+                f"pairs={int(pair_margin_stats.get('pair_count', 0))}, "
+                f"deployed={int(pair_margin_stats.get('deployed_pairs', 0))}, "
+                f"mode={pair_margin_stats.get('mode', '')}, "
+                f"strength={pair_margin_stats.get('strength', 0):.4f}, "
+                f"max_margin={pair_margin_stats.get('max_margin', 0):.4f}, "
+                f"calib_acc={pair_margin_stats.get('calibration_accuracy', 0):.4f}, "
+                f"compact_acc={pair_margin_stats.get('compact_accuracy', 0):.4f}, "
+                f"gain={pair_margin_stats.get('calibration_gain', 0):.4f}, "
+                f"gate_rate={pair_margin_stats.get('calibration_gate_rate', 0):.4f}, "
+                f"benefit_sel={pair_margin_stats.get('calibration_benefit_selected', 0):.0f}, "
+                f"harm_sel={pair_margin_stats.get('calibration_harm_selected', 0):.0f}, "
+                f"disabled={int(pair_margin_stats.get('gate_disabled', 0))}, "
+                f"eval_gate_rate={pair_margin_stats.get('eval_gate_rate', 0):.4f}, "
+                f"eval_change_rate={pair_margin_stats.get('eval_change_rate', 0):.4f}, "
+                f"eval_final_acc={pair_margin_stats.get('eval_final_accuracy', 0):.4f}"
+            )
         if edge_stats:
             logging.info(
                 f"[LifeTopoDict] Edge scoring: use_rate={edge_stats.get('edge_use_rate', 0):.4f}, "
@@ -572,6 +627,7 @@ class Learner(BaseLearner):
         fallback_calibration_loader = None
         atom_gate_calibration_loader = None
         score_bias_calibration_loader = None
+        pair_margin_calibration_loader = None
 
         test_dataset = get_cached_feature_dataset(
             self.args,
@@ -615,6 +671,10 @@ class Learner(BaseLearner):
             bool(getattr(self.hc_soinn, "use_score_bias_calibration", False))
             and int(getattr(self.hc_soinn, "score_bias_calibration_samples_per_class", 0)) > 0
         )
+        learned_pair_margin = (
+            bool(getattr(self.hc_soinn, "use_pair_margin_calibration", False))
+            and int(getattr(self.hc_soinn, "pair_margin_calibration_samples_per_class", 0)) > 0
+        )
         fallback_calibration_samples_per_class = int(
             getattr(self.hc_soinn, "fallback_calibration_samples_per_class", 0)
         )
@@ -624,12 +684,16 @@ class Learner(BaseLearner):
         score_bias_calibration_samples_per_class = int(
             getattr(self.hc_soinn, "score_bias_calibration_samples_per_class", 0)
         )
+        pair_margin_calibration_samples_per_class = int(
+            getattr(self.hc_soinn, "pair_margin_calibration_samples_per_class", 0)
+        )
         calibration_samples_per_class = max(
             fallback_calibration_samples_per_class if learned_fallback_gate else 0,
             atom_gate_calibration_samples_per_class if learned_atom_gate else 0,
             score_bias_calibration_samples_per_class if learned_score_bias else 0,
+            pair_margin_calibration_samples_per_class if learned_pair_margin else 0,
         )
-        if learned_fallback_gate or learned_atom_gate or learned_score_bias:
+        if learned_fallback_gate or learned_atom_gate or learned_score_bias or learned_pair_margin:
             if train_dataset_for_hc is not None:
                 train_dataset_for_hc, calibration_dataset = get_cached_feature_dataset_split(
                     self.args,
@@ -696,6 +760,23 @@ class Learner(BaseLearner):
                     shuffle=False,
                     num_workers=num_workers,
                 )
+            if calibration_dataset is not None and learned_pair_margin:
+                if self._pair_margin_calibration_cumulative:
+                    self._pair_margin_calibration_datasets.append(calibration_dataset)
+                    if len(self._pair_margin_calibration_datasets) == 1:
+                        pair_margin_calibration_dataset = self._pair_margin_calibration_datasets[0]
+                    else:
+                        pair_margin_calibration_dataset = ConcatDataset(
+                            list(self._pair_margin_calibration_datasets)
+                        )
+                else:
+                    pair_margin_calibration_dataset = calibration_dataset
+                pair_margin_calibration_loader = DataLoader(
+                    pair_margin_calibration_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                )
         else:
             calibration_dataset = None
         if train_dataset_for_hc is None:
@@ -718,6 +799,8 @@ class Learner(BaseLearner):
             log_feature_cache_loader(atom_gate_calibration_loader, "atom_gate_calibration_loader")
         if score_bias_calibration_loader is not None:
             log_feature_cache_loader(score_bias_calibration_loader, "score_bias_calibration_loader")
+        if pair_margin_calibration_loader is not None:
+            log_feature_cache_loader(pair_margin_calibration_loader, "pair_margin_calibration_loader")
 
         if len(self._multiple_gpus) > 1 and self._network is not None:
             logging.info("Using multiple GPUs")
@@ -730,6 +813,7 @@ class Learner(BaseLearner):
             fallback_calibration_loader=fallback_calibration_loader,
             atom_gate_calibration_loader=atom_gate_calibration_loader,
             score_bias_calibration_loader=score_bias_calibration_loader,
+            pair_margin_calibration_loader=pair_margin_calibration_loader,
         )
 
         if len(self._multiple_gpus) > 1 and self._network is not None:
@@ -743,6 +827,7 @@ class Learner(BaseLearner):
         fallback_calibration_loader=None,
         atom_gate_calibration_loader=None,
         score_bias_calibration_loader=None,
+        pair_margin_calibration_loader=None,
     ):
         if self._network is not None:
             self._network.to(self._device)
@@ -750,6 +835,7 @@ class Learner(BaseLearner):
         self._compress_task_boundary()
         self._fit_class_score_normalization(class_feature_data)
         self._calibrate_score_bias(score_bias_calibration_loader)
+        self._calibrate_pair_margin(pair_margin_calibration_loader)
         self._calibrate_atom_conflict_gate(atom_gate_calibration_loader)
         self._calibrate_raw_fallback_gate(fallback_calibration_loader)
 
@@ -854,6 +940,54 @@ class Learner(BaseLearner):
             int(disabled),
         )
 
+    def _calibrate_pair_margin(self, calibration_loader):
+        if calibration_loader is None:
+            return
+        if not bool(getattr(self.hc_soinn, "use_pair_margin_calibration", False)):
+            return
+        if not hasattr(self.hc_soinn, "fit_pair_margin_calibration_from_trace"):
+            return
+        logging.info(
+            "[LifeTopoDict] Calibrating pair-margin table on %d samples "
+            "(mode=%s, topk=%d, trace_split=%s).",
+            len(calibration_loader.dataset),
+            str(getattr(self.hc_soinn, "pair_margin_mode", "utility")),
+            int(getattr(self.hc_soinn, "pair_margin_topk", 0)),
+            getattr(self.hc_soinn, "trace_split", "test"),
+        )
+        original_trace = bool(getattr(self.hc_soinn, "enable_prediction_trace", False))
+        original_trace_split = str(getattr(self.hc_soinn, "trace_split", "test"))
+        self.hc_soinn.enable_prediction_trace = True
+        self.hc_soinn.trace_split = "pair_calibration"
+        try:
+            _ = self._eval_cnn(calibration_loader)
+            trace_records = self.hc_soinn.get_prediction_trace()
+            self._dump_prediction_trace_records(trace_records, split="pair_calibration")
+            fit_stats = self.hc_soinn.fit_pair_margin_calibration_from_trace(trace_records)
+        finally:
+            self.hc_soinn.enable_prediction_trace = original_trace
+            self.hc_soinn.trace_split = original_trace_split
+        if fit_stats:
+            logging.info(
+                "[LifeTopoDict] Pair margin fit: samples=%d, pairs=%d, deployed=%d, "
+                "mode=%s, strength=%.4f, max_margin=%.4f, calib_acc=%.4f, "
+                "compact_acc=%.4f, gain=%.4f, gate_rate=%.4f, benefit_sel=%.0f, "
+                "harm_sel=%.0f, disabled=%d",
+                int(fit_stats.get("samples", 0.0)),
+                int(fit_stats.get("pair_count", 0.0)),
+                int(fit_stats.get("deployed_pairs", 0.0)),
+                str(fit_stats.get("mode", "")),
+                float(fit_stats.get("strength", 0.0)),
+                float(fit_stats.get("max_margin", 0.0)),
+                float(fit_stats.get("calibration_accuracy", 0.0)),
+                float(fit_stats.get("compact_accuracy", 0.0)),
+                float(fit_stats.get("calibration_gain", 0.0)),
+                float(fit_stats.get("calibration_gate_rate", 0.0)),
+                float(fit_stats.get("calibration_benefit_selected", 0.0)),
+                float(fit_stats.get("calibration_harm_selected", 0.0)),
+                int(fit_stats.get("gate_disabled", 0.0)),
+            )
+
     def _calibrate_atom_conflict_gate(self, calibration_loader):
         if calibration_loader is None:
             return
@@ -953,6 +1087,8 @@ class Learner(BaseLearner):
             self.hc_soinn.reset_raw_auxiliary_eval_stats()
         if hasattr(self.hc_soinn, "reset_atom_conflict_eval_stats"):
             self.hc_soinn.reset_atom_conflict_eval_stats()
+        if hasattr(self.hc_soinn, "reset_pair_margin_eval_stats"):
+            self.hc_soinn.reset_pair_margin_eval_stats()
         from_cache = is_cached_feature_loader(loader)
         if not from_cache and self._network is None:
             raise RuntimeError(

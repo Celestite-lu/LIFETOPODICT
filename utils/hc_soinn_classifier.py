@@ -429,6 +429,16 @@ class HCSOINNClassifier:
         score_bias_calibration_samples_per_class: int = 0,
         score_bias_grid: object = "-0.03,-0.02,-0.015,-0.01,-0.005,0,0.005,0.01,0.015,0.02,0.03",
         score_bias_min_gain: float = 0.0,
+        # --- Ordered top1/top2 pair-margin calibration ---
+        use_pair_margin_calibration: bool = False,
+        pair_margin_calibration_samples_per_class: int = 0,
+        pair_margin_topk: int = 80,
+        pair_margin_strength: float = 0.02,
+        pair_margin_min_support: int = 2,
+        pair_margin_smoothing: float = 5.0,
+        pair_margin_max_margin: float = 0.08,
+        pair_margin_mode: str = "utility",
+        pair_margin_min_gain: float = 0.0,
         # --- Node residual reliability scoring ---
         use_node_residual_penalty: bool = False,
         node_residual_penalty_strength: float = 0.0,
@@ -618,6 +628,29 @@ class HCSOINNClassifier:
         self.score_bias_min_gain: float = max(0.0, float(score_bias_min_gain))
         self.score_bias_new: float = 0.0
         self._score_bias_fit_stats: Dict[str, float] = {}
+
+        # ------------------------------------------------------------------ #
+        # Ordered class-pair margin calibration. This is a sparse table fitted
+        # from held-out train traces: if compact top1/top2 pair (a,b) has
+        # positive flip utility, add a small distance penalty to a under a
+        # low-margin cap.
+        # ------------------------------------------------------------------ #
+        self.use_pair_margin_calibration: bool = bool(use_pair_margin_calibration)
+        self.pair_margin_calibration_samples_per_class: int = max(
+            0, int(pair_margin_calibration_samples_per_class)
+        )
+        self.pair_margin_topk: int = max(0, int(pair_margin_topk))
+        self.pair_margin_strength: float = max(0.0, float(pair_margin_strength))
+        self.pair_margin_min_support: int = max(1, int(pair_margin_min_support))
+        self.pair_margin_smoothing: float = max(0.0, float(pair_margin_smoothing))
+        self.pair_margin_max_margin: float = float(pair_margin_max_margin)
+        self.pair_margin_mode: str = str(pair_margin_mode).lower()
+        self.pair_margin_min_gain: float = max(0.0, float(pair_margin_min_gain))
+        self._pair_margin_model: Dict[str, object] = {}
+        self._pair_margin_model_dirty: bool = True
+        self._pair_margin_fit_stats: Dict[str, object] = {}
+        self._pair_margin_eval_stats: Dict[str, float] = {}
+        self.reset_pair_margin_eval_stats()
 
         # ------------------------------------------------------------------ #
         # Node residual reliability scoring. Uses existing per-node dictionary
@@ -1053,6 +1086,20 @@ class HCSOINNClassifier:
             "harm_selected": 0.0,
         }
 
+    def reset_pair_margin_eval_stats(self) -> None:
+        """Reset per-evaluation pair-margin calibration accumulators."""
+        self._pair_margin_eval_stats = {
+            "samples": 0.0,
+            "gate_used": 0.0,
+            "prediction_changed": 0.0,
+            "score_sum": 0.0,
+            "penalty_sum": 0.0,
+            "compact_correct": 0.0,
+            "final_correct": 0.0,
+            "benefit_selected": 0.0,
+            "harm_selected": 0.0,
+        }
+
     def get_prediction_trace(self) -> List[Dict[str, object]]:
         """Return the most recent eval prediction trace records."""
         return list(getattr(self, "_prediction_trace_records", []))
@@ -1346,6 +1393,21 @@ class HCSOINNClassifier:
             "score_bias_model_bytes": total_bytes,
         }
 
+    def _pair_margin_model_bytes(self) -> Dict[str, float]:
+        """Return storage bytes for the ordered class-pair margin table."""
+        total_bytes = 0.0
+        if bool(getattr(self, "use_pair_margin_calibration", False)):
+            model = getattr(self, "_pair_margin_model", {}) or {}
+            table = model.get("score_table")
+            if isinstance(table, dict):
+                # ordered top1 class id, top2 class id, score
+                total_bytes += float(len(table) * (4 + 4 + 4))
+            # strength, margin cap, smoothing, min-gain, and mode/topk metadata
+            total_bytes += 8.0 * 5.0
+        return {
+            "pair_margin_model_bytes": total_bytes,
+        }
+
     def _node_residual_penalty_model_bytes(self) -> Dict[str, float]:
         """Return storage bytes for residual-penalty inference scalars."""
         total_bytes = 0.0
@@ -1530,6 +1592,206 @@ class HCSOINNClassifier:
                 total += float(weight) * float(table.get((int(atom), int(cls)), 0.0))
             scores[row] = float(total)
         return scores
+
+    def _stable_pair_unit_score(self, first_cls: int, second_cls: int) -> float:
+        """Deterministic pseudo-random pair score for budget-matched controls."""
+        seed = int(getattr(self, "_fallback_random_seed", 0))
+        mixed = (
+            (int(first_cls) + 1) * 1000003
+            + (int(second_cls) + 1) * 9176
+            + seed * 1315423911
+        ) & 0xFFFFFFFF
+        return float(np.random.RandomState(mixed).rand())
+
+    def _pair_margin_lookup_scores(
+        self,
+        top1_classes: np.ndarray,
+        top2_classes: np.ndarray,
+        margins: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return pair-margin utility scores and applicability mask."""
+        model = getattr(self, "_pair_margin_model", {}) or {}
+        if bool(getattr(self, "_pair_margin_model_dirty", True)):
+            n = len(top1_classes)
+            return np.zeros(n, dtype=np.float32), np.zeros(n, dtype=bool)
+        table = model.get("score_table")
+        if not isinstance(table, dict) or not table:
+            n = len(top1_classes)
+            return np.zeros(n, dtype=np.float32), np.zeros(n, dtype=bool)
+
+        scores = np.zeros(len(top1_classes), dtype=np.float32)
+        applies = np.zeros(len(top1_classes), dtype=bool)
+        cap = float(model.get("max_margin", getattr(self, "pair_margin_max_margin", 0.0)))
+        margins = np.asarray(margins, dtype=np.float32)
+        for row, (first_cls, second_cls) in enumerate(zip(top1_classes, top2_classes)):
+            score = float(table.get((int(first_cls), int(second_cls)), 0.0))
+            if score <= 0.0:
+                continue
+            margin = float(margins[row]) if row < margins.shape[0] else float("inf")
+            if not np.isfinite(margin):
+                continue
+            if cap > 0.0 and margin > cap:
+                continue
+            scores[row] = score
+            applies[row] = True
+        return scores, applies
+
+    def fit_pair_margin_calibration_from_trace(
+        self,
+        trace_records: List[Dict[str, object]],
+    ) -> Dict[str, object]:
+        """Fit sparse ordered top1/top2 class-pair repairs from held-out traces."""
+        mode = str(getattr(self, "pair_margin_mode", "utility")).lower()
+        strength = float(getattr(self, "pair_margin_strength", 0.0))
+        topk = int(getattr(self, "pair_margin_topk", 0))
+        min_support = int(getattr(self, "pair_margin_min_support", 1))
+        smoothing = float(getattr(self, "pair_margin_smoothing", 0.0))
+        max_margin = float(getattr(self, "pair_margin_max_margin", 0.0))
+        min_gain = float(getattr(self, "pair_margin_min_gain", 0.0))
+
+        if not trace_records or strength <= 0.0 or topk <= 0:
+            self._pair_margin_model = {}
+            self._pair_margin_model_dirty = True
+            self._pair_margin_fit_stats = {
+                "enabled": float(bool(getattr(self, "use_pair_margin_calibration", False))),
+                "samples": float(len(trace_records) if trace_records else 0),
+                "gate_disabled": 1.0,
+            }
+            return self._pair_margin_fit_stats
+
+        support: Dict[Tuple[int, int], float] = defaultdict(float)
+        benefit: Dict[Tuple[int, int], float] = defaultdict(float)
+        harm: Dict[Tuple[int, int], float] = defaultdict(float)
+        sim_records: List[Tuple[int, int, float, bool, bool]] = []
+
+        for rec in trace_records:
+            top1 = rec.get("compact_top1", rec.get("selected_class"))
+            top2 = rec.get("compact_top2")
+            target = rec.get("target")
+            margin = rec.get("compact_margin")
+            if top1 is None or top2 is None or target is None or margin is None:
+                continue
+            top1 = int(top1)
+            top2 = int(top2)
+            if top1 == top2:
+                continue
+            margin = float(margin)
+            if not np.isfinite(margin) or margin < 0.0:
+                continue
+            target = int(target)
+            key = (top1, top2)
+            compact_correct = top1 == target
+            top2_correct = top2 == target
+            support[key] += 1.0
+            if (not compact_correct) and top2_correct:
+                benefit[key] += 1.0
+            elif compact_correct and (not top2_correct):
+                harm[key] += 1.0
+            sim_records.append((top1, top2, margin, compact_correct, top2_correct))
+
+        if not sim_records:
+            self._pair_margin_model = {}
+            self._pair_margin_model_dirty = True
+            self._pair_margin_fit_stats = {
+                "enabled": float(bool(getattr(self, "use_pair_margin_calibration", False))),
+                "samples": 0.0,
+                "gate_disabled": 1.0,
+            }
+            return self._pair_margin_fit_stats
+
+        candidates: List[Tuple[float, float, Tuple[int, int]]] = []
+        for key, count in support.items():
+            if count < min_support:
+                continue
+            b = float(benefit.get(key, 0.0))
+            h = float(harm.get(key, 0.0))
+            if mode in ("high_support", "support"):
+                rank_score = count
+                deploy_score = count / (count + smoothing)
+            elif mode in ("random", "random_control"):
+                rank_score = self._stable_pair_unit_score(key[0], key[1])
+                deploy_score = count / (count + smoothing)
+            else:
+                deploy_score = (b - h) / (count + smoothing)
+                rank_score = deploy_score
+                if deploy_score <= 0.0:
+                    continue
+            if deploy_score <= 0.0:
+                continue
+            candidates.append((rank_score, deploy_score, key))
+
+        candidates.sort(key=lambda item: (item[0], support[item[2]]), reverse=True)
+        selected = candidates[:topk]
+        score_table = {
+            (int(key[0]), int(key[1])): float(deploy_score)
+            for _, deploy_score, key in selected
+        }
+
+        compact_correct = np.asarray([row[3] for row in sim_records], dtype=bool)
+        final_correct = compact_correct.copy()
+        gate_used = np.zeros(len(sim_records), dtype=bool)
+        prediction_changed = np.zeros(len(sim_records), dtype=bool)
+        benefit_selected = 0
+        harm_selected = 0
+        for idx, (top1, top2, margin, top1_correct, top2_correct) in enumerate(sim_records):
+            score = float(score_table.get((int(top1), int(top2)), 0.0))
+            if score <= 0.0:
+                continue
+            if max_margin > 0.0 and float(margin) > max_margin:
+                continue
+            gate_used[idx] = True
+            if strength * score > float(margin):
+                prediction_changed[idx] = True
+                final_correct[idx] = bool(top2_correct)
+                if (not top1_correct) and top2_correct:
+                    benefit_selected += 1
+                elif top1_correct and (not top2_correct):
+                    harm_selected += 1
+
+        compact_acc = float(np.mean(compact_correct)) if compact_correct.size else 0.0
+        final_acc = float(np.mean(final_correct)) if final_correct.size else 0.0
+        gain = float(final_acc - compact_acc)
+        disabled = 0.0
+        if gain < min_gain or not score_table:
+            self._pair_margin_model = {}
+            self._pair_margin_model_dirty = True
+            score_table = {}
+            final_acc = compact_acc
+            gain = 0.0
+            gate_used[:] = False
+            prediction_changed[:] = False
+            benefit_selected = 0
+            harm_selected = 0
+            disabled = 1.0
+        else:
+            self._pair_margin_model = {
+                "type": "pair_margin",
+                "score_table": score_table,
+                "strength": float(strength),
+                "max_margin": float(max_margin),
+                "mode": mode,
+                "smoothing": float(smoothing),
+            }
+            self._pair_margin_model_dirty = False
+
+        self._pair_margin_fit_stats = {
+            "enabled": float(bool(getattr(self, "use_pair_margin_calibration", False))),
+            "samples": float(len(sim_records)),
+            "pair_count": float(len(support)),
+            "deployed_pairs": float(len(score_table)),
+            "mode": mode,
+            "strength": float(strength),
+            "max_margin": float(max_margin),
+            "compact_accuracy": float(compact_acc),
+            "calibration_accuracy": float(final_acc),
+            "calibration_gain": float(gain),
+            "calibration_gate_rate": float(np.mean(gate_used)) if gate_used.size else 0.0,
+            "calibration_change_rate": float(np.mean(prediction_changed)) if prediction_changed.size else 0.0,
+            "calibration_benefit_selected": float(benefit_selected),
+            "calibration_harm_selected": float(harm_selected),
+            "gate_disabled": float(disabled),
+        }
+        return self._pair_margin_fit_stats
 
     def fit_atom_conflict_gate_from_trace(
         self,
@@ -3959,6 +4221,9 @@ class HCSOINNClassifier:
         score_bias_storage = self._score_bias_model_bytes()
         score_bias_model_bytes = float(score_bias_storage.get('score_bias_model_bytes', 0.0))
         breakdown.update(score_bias_storage)
+        pair_margin_storage = self._pair_margin_model_bytes()
+        pair_margin_model_bytes = float(pair_margin_storage.get('pair_margin_model_bytes', 0.0))
+        breakdown.update(pair_margin_storage)
         residual_penalty_storage = self._node_residual_penalty_model_bytes()
         node_residual_penalty_model_bytes = float(
             residual_penalty_storage.get('node_residual_penalty_model_bytes', 0.0)
@@ -4011,6 +4276,7 @@ class HCSOINNClassifier:
             compact += raw_fallback_total_bytes + raw_fallback_gate_model_bytes
         compact += atom_conflict_gate_model_bytes
         compact += score_bias_model_bytes
+        compact += pair_margin_model_bytes
         compact += node_residual_penalty_model_bytes
         compact += node_residual_repair_model_bytes
         compact += raw_auxiliary_model_bytes
@@ -4074,6 +4340,7 @@ class HCSOINNClassifier:
             raw_fallback_gate_model_bytes +
             atom_conflict_gate_model_bytes +
             score_bias_model_bytes +
+            pair_margin_model_bytes +
             node_residual_penalty_model_bytes +
             raw_auxiliary_model_bytes +
             class_score_normalization_model_bytes +
@@ -4147,6 +4414,8 @@ class HCSOINNClassifier:
         fallback_gate_stats = dict(getattr(self, '_raw_fallback_gate_fit_stats', {}))
         atom_gate_stats = dict(getattr(self, '_atom_conflict_gate_fit_stats', {}))
         atom_eval_stats = dict(getattr(self, '_atom_conflict_eval_stats', {}))
+        pair_margin_stats = dict(getattr(self, '_pair_margin_fit_stats', {}))
+        pair_margin_eval_stats = dict(getattr(self, '_pair_margin_eval_stats', {}))
         class_score_norm_stats = dict(getattr(self, '_class_score_norm_fit_stats', {}))
         node_residual_repair_stats = self._summarize_node_residual_repair_stats()
         if atom_gate_stats:
@@ -4159,6 +4428,17 @@ class HCSOINNClassifier:
                     'eval_final_accuracy': float(atom_eval_stats.get('final_correct', 0.0)) / samples_eval,
                     'eval_benefit_selected': float(atom_eval_stats.get('benefit_selected', 0.0)),
                     'eval_harm_selected': float(atom_eval_stats.get('harm_selected', 0.0)),
+                })
+        if pair_margin_stats:
+            samples_eval = float(pair_margin_eval_stats.get('samples', 0.0))
+            if samples_eval > 0.0:
+                pair_margin_stats.update({
+                    'eval_gate_rate': float(pair_margin_eval_stats.get('gate_used', 0.0)) / samples_eval,
+                    'eval_change_rate': float(pair_margin_eval_stats.get('prediction_changed', 0.0)) / samples_eval,
+                    'eval_compact_accuracy': float(pair_margin_eval_stats.get('compact_correct', 0.0)) / samples_eval,
+                    'eval_final_accuracy': float(pair_margin_eval_stats.get('final_correct', 0.0)) / samples_eval,
+                    'eval_benefit_selected': float(pair_margin_eval_stats.get('benefit_selected', 0.0)),
+                    'eval_harm_selected': float(pair_margin_eval_stats.get('harm_selected', 0.0)),
                 })
         self._last_fallback_stats = fallback_stats
         inactive_node_ratio = float(lifecycle_summary.get('inactive_node_ratio', 0.0))
@@ -4187,6 +4467,7 @@ class HCSOINNClassifier:
             'raw_auxiliary_stats': raw_auxiliary_stats,
             'raw_fallback_gate_stats': fallback_gate_stats,
             'atom_conflict_gate_stats': atom_gate_stats,
+            'pair_margin_stats': pair_margin_stats,
             'class_score_normalization_stats': class_score_norm_stats,
             'node_residual_repair_stats': node_residual_repair_stats,
         }
@@ -4216,6 +4497,8 @@ class HCSOINNClassifier:
         self._raw_fallback_gate_model = {}
         self._atom_conflict_gate_model_dirty = True
         self._atom_conflict_gate_model = {}
+        self._pair_margin_model_dirty = True
+        self._pair_margin_model = {}
 
     # ------------------------------------------------------------------ #
     # Inference profiling helpers
@@ -5586,6 +5869,7 @@ class HCSOINNClassifier:
             getattr(self, 'enable_prediction_trace', False)
             or getattr(self, 'use_raw_fallback_gate', False)
             or getattr(self, 'use_atom_conflict_gate', False)
+            or getattr(self, 'use_pair_margin_calibration', False)
             or getattr(self, 'use_raw_auxiliary_nodes', False)
         )
         valid_classes_np = np.array(valid_classes, dtype=np.int64)
@@ -5721,6 +6005,31 @@ class HCSOINNClassifier:
                 atom_conflict_gate_np = atom_conflict_penalty_np > 0.0
                 if np.any(atom_conflict_gate_np):
                     penalty_t = torch.from_numpy(atom_conflict_penalty_np).to(
+                        device=device, dtype=final_scores.dtype
+                    )
+                    final_scores = final_scores.clone()
+                    row_idx_t = torch.arange(N, device=device)
+                    final_scores[row_idx_t, compact_top1_idx_t] = (
+                        final_scores[row_idx_t, compact_top1_idx_t] + penalty_t
+                    )
+
+            pair_margin_score_np = np.zeros(N, dtype=np.float32)
+            pair_margin_penalty_np = np.zeros(N, dtype=np.float32)
+            pair_margin_gate_np = np.zeros(N, dtype=bool)
+            if bool(getattr(self, "use_pair_margin_calibration", False)):
+                pair_margin_score_np, pair_margin_gate_np = self._pair_margin_lookup_scores(
+                    compact_top1_labels_np,
+                    compact_top2_labels_np,
+                    compact_margin_np,
+                )
+                pair_model = getattr(self, "_pair_margin_model", {}) or {}
+                strength = float(pair_model.get(
+                    "strength",
+                    getattr(self, "pair_margin_strength", 0.0),
+                ))
+                pair_margin_penalty_np = (strength * pair_margin_score_np).astype(np.float32)
+                if np.any(pair_margin_gate_np):
+                    penalty_t = torch.from_numpy(pair_margin_penalty_np).to(
                         device=device, dtype=final_scores.dtype
                     )
                     final_scores = final_scores.clone()
@@ -6116,6 +6425,9 @@ class HCSOINNClassifier:
                 "atom_conflict_score": atom_conflict_score_np,
                 "atom_conflict_penalty": atom_conflict_penalty_np,
                 "atom_conflict_gate": atom_conflict_gate_np,
+                "pair_margin_score": pair_margin_score_np,
+                "pair_margin_penalty": pair_margin_penalty_np,
+                "pair_margin_gate": pair_margin_gate_np,
                 "raw_auxiliary_available": raw_auxiliary_available_np,
                 "fallback_available": fallback_available_np,
                 "fallback_top1_labels": fallback_top1_labels_np,
@@ -6180,6 +6492,14 @@ class HCSOINNClassifier:
             atom_stats["score_sum"] += float(np.sum(trace_info.get("atom_conflict_score", np.zeros(samples))))
             atom_stats["penalty_sum"] += float(np.sum(trace_info.get("atom_conflict_penalty", np.zeros(samples))))
 
+            pair_stats = self._pair_margin_eval_stats
+            pair_gate = trace_info.get("pair_margin_gate", np.zeros(samples, dtype=bool)).astype(bool)
+            pair_stats["samples"] += float(samples)
+            pair_stats["gate_used"] += float(np.sum(pair_gate))
+            pair_stats["prediction_changed"] += float(np.sum(np.logical_and(pair_gate, prediction_changed)))
+            pair_stats["score_sum"] += float(np.sum(trace_info.get("pair_margin_score", np.zeros(samples))))
+            pair_stats["penalty_sum"] += float(np.sum(trace_info.get("pair_margin_penalty", np.zeros(samples))))
+
             if bool(getattr(self, "use_raw_auxiliary_nodes", False)):
                 raw_aux_stats = self._raw_auxiliary_eval_stats
                 raw_aux_available = trace_info.get(
@@ -6217,6 +6537,15 @@ class HCSOINNClassifier:
                 )
                 atom_stats["harm_selected"] += float(
                     np.sum(np.logical_and.reduce((atom_changed, compact_correct, ~final_correct)))
+                )
+                pair_changed = np.logical_and(pair_gate, prediction_changed)
+                pair_stats["compact_correct"] += float(np.sum(compact_correct))
+                pair_stats["final_correct"] += float(np.sum(final_correct))
+                pair_stats["benefit_selected"] += float(
+                    np.sum(np.logical_and.reduce((pair_changed, ~compact_correct, final_correct)))
+                )
+                pair_stats["harm_selected"] += float(
+                    np.sum(np.logical_and.reduce((pair_changed, compact_correct, ~final_correct)))
                 )
                 if bool(getattr(self, "use_raw_auxiliary_nodes", False)):
                     raw_aux_stats = self._raw_auxiliary_eval_stats
@@ -6263,6 +6592,9 @@ class HCSOINNClassifier:
                         "atom_conflict_score": float(trace_info["atom_conflict_score"][row]),
                         "atom_conflict_penalty": float(trace_info["atom_conflict_penalty"][row]),
                         "atom_conflict_used": bool(trace_info["atom_conflict_gate"][row]),
+                        "pair_margin_score": float(trace_info["pair_margin_score"][row]),
+                        "pair_margin_penalty": float(trace_info["pair_margin_penalty"][row]),
+                        "pair_margin_used": bool(trace_info["pair_margin_gate"][row]),
                         "raw_auxiliary_available": bool(trace_info["raw_auxiliary_available"][row]),
                         "raw_auxiliary_penalty": float(getattr(self, "raw_auxiliary_penalty", 0.0)),
                         "raw_auxiliary_scope": str(getattr(self, "raw_auxiliary_scope", "all")),

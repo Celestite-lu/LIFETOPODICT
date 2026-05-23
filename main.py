@@ -65,6 +65,11 @@ def main():
         'use_score_bias_calibration', 'score_bias_calibration_samples_per_class',
         'score_bias_calibration_cumulative', 'score_bias_grid',
         'score_bias_min_gain',
+        'use_pair_margin_calibration', 'pair_margin_calibration_samples_per_class',
+        'pair_margin_calibration_cumulative', 'pair_margin_topk',
+        'pair_margin_strength', 'pair_margin_min_support',
+        'pair_margin_smoothing', 'pair_margin_max_margin',
+        'pair_margin_mode', 'pair_margin_min_gain',
         'use_node_residual_penalty', 'node_residual_penalty_strength',
         'node_residual_penalty_mode',
         'use_node_residual_repair', 'node_residual_repair_per_class',
@@ -245,6 +250,26 @@ def setup_parser():
                         help='Comma-separated candidate new-class score biases; lower scores are better.')
     parser.add_argument('--score_bias_min_gain', type=float, default=None,
                         help='Minimum calibration accuracy gain required to deploy a nonzero score bias.')
+    parser.add_argument('--use_pair_margin_calibration', type=_str2bool, default=None,
+                        help='Fit a train-calibration ordered top1/top2 class-pair margin repair table.')
+    parser.add_argument('--pair_margin_calibration_samples_per_class', type=int, default=None,
+                        help='Per-class held-out train samples used to fit pair-margin calibration.')
+    parser.add_argument('--pair_margin_calibration_cumulative', type=_str2bool, default=None,
+                        help='Fit pair-margin calibration on cumulative held-out train samples.')
+    parser.add_argument('--pair_margin_topk', type=int, default=None,
+                        help='Number of ordered class-pair margin repair entries to deploy.')
+    parser.add_argument('--pair_margin_strength', type=float, default=None,
+                        help='Distance penalty strength for deployed ordered class-pair repairs.')
+    parser.add_argument('--pair_margin_min_support', type=int, default=None,
+                        help='Minimum calibration support for a pair-margin repair entry.')
+    parser.add_argument('--pair_margin_smoothing', type=float, default=None,
+                        help='Smoothing denominator for pair-margin utility estimates.')
+    parser.add_argument('--pair_margin_max_margin', type=float, default=None,
+                        help='Only apply pair-margin repair when compact top1/top2 margin is below this cap.')
+    parser.add_argument('--pair_margin_mode', type=str, default=None,
+                        help='Pair-margin entry ranking: utility, high_support, or random_control.')
+    parser.add_argument('--pair_margin_min_gain', type=float, default=None,
+                        help='Minimum calibration accuracy gain required to deploy pair-margin repairs.')
     parser.add_argument('--use_node_residual_penalty', type=_str2bool, default=None,
                         help='Penalize compact topology node distances by dictionary reconstruction residual.')
     parser.add_argument('--node_residual_penalty_strength', type=float, default=None,

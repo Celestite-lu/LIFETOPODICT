@@ -116,6 +116,12 @@ _RE_SCORE_BIAS_FIT_LINE = re.compile(
 _RE_SCORE_BIAS_VALUE = re.compile(
     r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
 )
+_RE_PAIR_MARGIN_FIT_LINE = re.compile(
+    r'\[LifeTopoDict\] Pair margin fit:'
+)
+_RE_PAIR_MARGIN_VALUE = re.compile(
+    r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
+)
 _RE_CONFIG_PREFIX = re.compile(
     r'prefix:[ \t]*(.*)'
 )
@@ -386,6 +392,14 @@ def _parse_log_block(log_path: str, content: str, block_index: int) -> Dict[str,
             if parsed is not None:
                 result[f'score_bias_{key}'] = parsed
 
+    pair_margin_pos = content.rfind('[LifeTopoDict] Pair margin fit:')
+    if pair_margin_pos >= 0:
+        pair_margin_line = content[pair_margin_pos:].splitlines()[0]
+        for key, value in _RE_PAIR_MARGIN_VALUE.findall(pair_margin_line):
+            parsed = _safe_float(value)
+            if parsed is not None:
+                result[f'pair_margin_{key}'] = parsed
+
     return result
 
 
@@ -481,6 +495,7 @@ def write_csv(
         'memory_fallback_mb', 'memory_fallback_gate_mb',
         'memory_residual_penalty_mb', 'memory_residual_repair_mb',
         'memory_raw_aux_mb',
+        'memory_pair_margin_mb',
         'edge_use_rate', 'edge_class_use_rate', 'edge_margin_contribution',
         'edge_risk_penalty', 'edge_score_adjustment',
         'raw_auxiliary_enabled', 'raw_auxiliary_penalty',
@@ -500,6 +515,9 @@ def write_csv(
         'score_bias_samples', 'score_bias_compact_acc',
         'score_bias_calib_acc', 'score_bias_gain',
         'score_bias_bias', 'score_bias_disabled',
+        'pair_margin_samples', 'pair_margin_deployed',
+        'pair_margin_gain', 'pair_margin_gate_rate',
+        'pair_margin_disabled',
     ]
 
     all_keys: List[str] = []
