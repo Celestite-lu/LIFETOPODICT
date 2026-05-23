@@ -228,13 +228,27 @@ Git is the safety rail for autonomous research. The agent should use it automati
 Authentication:
 
 - Do not store GitHub tokens in remote URLs, scripts, config files, logs, or reports.
-- Prefer SSH authentication:
+- Use the configured SSH remote for this repository:
 
 ```bash
-git remote set-url origin git@github.com:Celestite-lu/LIFETOPODICT.git
+git remote set-url origin git@github-lifetopo:Celestite-lu/LIFETOPODICT.git
+git remote -v
 ```
 
-- If HTTPS is used, rely on an OS credential manager or GitHub CLI login outside this program. Never paste a token into a command.
+- Expected remote:
+
+```text
+origin  git@github-lifetopo:Celestite-lu/LIFETOPODICT.git (fetch)
+origin  git@github-lifetopo:Celestite-lu/LIFETOPODICT.git (push)
+```
+
+- Verify SSH before a long autonomous run:
+
+```bash
+ssh -T github-lifetopo
+```
+
+- If HTTPS is used elsewhere, rely on an OS credential manager or GitHub CLI login outside this program. Never paste a token into a command.
 - If push authentication is unavailable, keep local commits and continue. Local rollback is still valid.
 
 Stable anchors:
@@ -251,6 +265,7 @@ Per-experiment workflow:
 ```bash
 git status --short
 EXP_START=$(git rev-parse HEAD)
+EXP_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 ```
 
 The working tree should be clean except for ignored logs/results. If tracked files are dirty, inspect them before starting; do not overwrite unknown user edits.
@@ -266,9 +281,9 @@ EXP_COMMIT=$(git rev-parse HEAD)
 Then run the experiment. When judging the result:
 
 ```text
-success or useful infrastructure -> keep commit, optionally add a follow-up report commit
-failure with no reusable value -> git reset --hard "$EXP_START"
-crash from typo -> fix and amend/rerun once
+success or useful infrastructure -> keep commit, optionally add a follow-up report commit, then push
+failure with no reusable value -> git reset --hard "$EXP_START", then do not push the failed commit
+crash from typo -> fix and amend/rerun once; if still failed, reset to EXP_START
 ```
 
 Rollback rules:
@@ -292,11 +307,30 @@ git checkout autoresearch/lifetopo-<date>
 Push policy:
 
 ```bash
-git push -u origin autoresearch/lifetopo-<date>
+git push origin "$EXP_BRANCH"
 git push origin main --tags
 ```
 
-Push only kept commits. Do not push failed experiment commits unless they are explicitly kept as diagnostic infrastructure.
+Push only kept commits. Do not push failed experiment commits unless they are explicitly kept as diagnostic infrastructure. If push fails, do not retry with embedded credentials; keep the local commit and continue.
+
+Canonical autonomous experiment shell pattern:
+
+```bash
+EXP_START=$(git rev-parse HEAD)
+EXP_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# edit code/config/docs
+git add <changed code/config/docs>
+git commit -m "exp(<tag>): <short hypothesis>"
+
+# run smoke + experiment + collect results
+
+if <success_or_useful_diagnostic>; then
+  git push origin "$EXP_BRANCH"
+else
+  git reset --hard "$EXP_START"
+fi
+```
 
 ## Baselines To Keep At Hand
 
@@ -330,6 +364,7 @@ LOOP FOREVER until interrupted by the user.
 ```bash
 git status --short
 EXP_START=$(git rev-parse HEAD)
+EXP_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 ```
 
 3. Pick one idea with a concrete hypothesis and a kill criterion. If this is a new mechanism, first read relevant summaries in `docs/paper/` and write a short rationale in the run report before coding.
@@ -437,6 +472,7 @@ done
 15. If git is available:
     - keep successful code/config/report commits;
     - for successful follow-up docs/config updates, create a follow-up commit;
+    - push kept commits with `git push origin "$EXP_BRANCH"`;
     - for failed experimental code with no reusable value, run `git reset --hard "$EXP_START"` after recording the result;
     - for useful failed infrastructure, keep the commit but mark the method as `diagnostic`.
 16. If git is not available:
