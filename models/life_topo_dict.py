@@ -1,0 +1,678 @@
+import logging
+import json
+import numpy as np
+import os
+import torch
+from torch import nn
+from torch.utils.data import ConcatDataset, DataLoader
+
+from utils.inc_net import SimpleVitNetKNN
+from models.base import BaseLearner
+from utils.toolkit import tensor2numpy
+from utils.hc_soinn_classifier import HCSOINNClassifier
+from utils.feature_cache import (
+    feature_cache_classifier_only,
+    feature_cache_classifier_torch_device,
+    get_cached_feature_dataset,
+    get_cached_feature_dataset_split,
+    is_cached_feature_loader,
+    log_feature_cache_loader,
+)
+
+
+num_workers = 8
+batch_size = 128
+
+
+class Learner(BaseLearner):
+    """LifeTopoDict learner: SimpleCIL backbone with HC-SOINN + dictionary coding.
+
+    Inherits the same frozen-backbone, prototype-only philosophy as
+    ``simplecil_hc_soinn`` but enables ``use_dict_coding=True`` in the
+    HC-SOINN classifier so that sparse dictionary coding, lifecycle
+    management and residual-growth are activated during ``compress()``.
+    """
+
+    def __init__(self, args):
+        super().__init__(args)
+        self.args = args
+        self._feature_cache_classifier_only = feature_cache_classifier_only(args)
+        self._classifier_device = (
+            feature_cache_classifier_torch_device(args, self._device)
+            if self._feature_cache_classifier_only
+            else self._device
+        )
+        if self._feature_cache_classifier_only:
+            self._network = None
+            logging.info(
+                "[FeatureCache] Classifier-only mode enabled: skipping backbone "
+                "initialization for LifeTopoDict; classifier_device=%s",
+                self._classifier_device,
+            )
+        else:
+            self._network = SimpleVitNetKNN(args, True)
+
+        # --- LifeTopoDict-specific parameters ---
+        dict_sparse_k = args.get("dict_sparse_k", 5)
+        dict_ridge_lambda = args.get("dict_ridge_lambda", 0.1)
+        lifecycle_theta_support = args.get("lifecycle_theta_support", 0.5)
+        lifecycle_theta_usage = args.get("lifecycle_theta_usage", 0.01)
+        lifecycle_T_inactive = args.get("lifecycle_T_inactive", 3)
+        lifecycle_min_alive_ratio = args.get("lifecycle_min_alive_ratio", 0.70)
+        lifecycle_protect_old_topk = args.get("lifecycle_protect_old_topk", True)
+        lifecycle_node_inactive_threshold = args.get("lifecycle_node_inactive_threshold", 1.0)
+        dict_theta_residual = args.get("dict_theta_residual", 0.3)
+        dict_max_growth_per_task = args.get("dict_max_growth_per_task", 0)
+        drop_node_raw_after_dict_materialize = args.get(
+            "drop_node_raw_after_dict_materialize", True
+        )
+        use_raw_fallback_gate = args.get("use_raw_fallback_gate", False)
+        raw_fallback_per_class = args.get("raw_fallback_per_class", 0)
+        raw_fallback_select_by = args.get("raw_fallback_select_by", "residual")
+        fallback_gate_type = args.get("fallback_gate_type", "rule")
+        fallback_gate_margin_threshold = args.get("fallback_gate_margin_threshold", 0.05)
+        fallback_gate_residual_threshold = args.get("fallback_gate_residual_threshold", 0.08)
+        fallback_gate_random_rate = args.get("fallback_gate_random_rate", 0.10)
+        fallback_memory_accounting = args.get("fallback_memory_accounting", True)
+        fallback_calibration_samples_per_class = args.get("fallback_calibration_samples_per_class", 0)
+        fallback_calibration_cumulative = args.get("fallback_calibration_cumulative", True)
+        fallback_gate_min_positives = args.get("fallback_gate_min_positives", 5)
+        fallback_gate_min_calibration_gain = args.get("fallback_gate_min_calibration_gain", 0.001)
+        fallback_gate_max_rate = args.get("fallback_gate_max_rate", 1.0)
+        fallback_gate_tree_estimators = args.get("fallback_gate_tree_estimators", 160)
+        fallback_gate_tree_max_depth = args.get("fallback_gate_tree_max_depth", 2)
+        fallback_gate_tree_min_samples_leaf = args.get("fallback_gate_tree_min_samples_leaf", 12)
+        fallback_gate_threshold_strategy = args.get("fallback_gate_threshold_strategy", "max_net")
+        fallback_gate_min_precision = args.get("fallback_gate_min_precision", 0.0)
+        fallback_gate_min_selected = args.get("fallback_gate_min_selected", 0)
+        fallback_gate_min_net_count = args.get("fallback_gate_min_net_count", 0)
+        fallback_candidate_rule = args.get("fallback_candidate_rule", "none")
+        fallback_gate_budget_rates = args.get("fallback_gate_budget_rates", "0.002,0.005,0.01,0.02,0.04")
+        fallback_gate_neutral_weight = args.get("fallback_gate_neutral_weight", 0.25)
+        fallback_pair_table_mode = args.get("fallback_pair_table_mode", "none")
+        fallback_pair_table_smoothing = args.get("fallback_pair_table_smoothing", 10.0)
+        fallback_pair_table_lambda = args.get("fallback_pair_table_lambda", 0.5)
+        fallback_node_table_lambda = args.get("fallback_node_table_lambda", 0.5)
+        enable_prediction_trace = args.get("enable_prediction_trace", False)
+        trace_split = args.get("trace_split", "test")
+
+        # --- Ablation switches. Growth and additive edge-aware scoring are
+        # kept for historical reproducibility only; future experiments keep
+        # them disabled.
+        use_dictionary_growth = args.get("use_dictionary_growth", False)
+        use_lifecycle = args.get("use_lifecycle", True)
+        use_protected_gate = args.get("use_protected_gate", True)
+        use_edge_age_persistence = args.get("use_edge_age_persistence", True)
+        use_edge_aware_scoring = args.get("use_edge_aware_scoring", False)
+        edge_score_gamma = args.get("edge_score_gamma", 0.1)
+        edge_score_eta = args.get("edge_score_eta", 0.05)
+
+        self.hc_soinn = HCSOINNClassifier(
+            max_prototypes_per_class=args.get("hcsoinn_max_proto_per_class", 20),
+            alpha=args.get("hcsoinn_alpha", 0.5),
+            tau_merge=args.get("hcsoinn_tau_merge", 0.2),
+            tau_reject=args.get("hcsoinn_tau_reject", 2.0),
+            linkage_method=args.get("hcsoinn_linkage", "average"),
+            distance_metric=args.get("hcsoinn_distance", "cosine"),
+            use_soinn_refinement=args.get("hcsoinn_use_soinn_refinement", True),
+            soinn_ad=args.get("hcsoinn_soinn_ad", 20),
+            soinn_lam=args.get("hcsoinn_soinn_lam", 20),
+            soinn_threshold_scale=args.get("hcsoinn_soinn_threshold_scale", 0.5),
+            soinn_max_iter=args.get("hcsoinn_soinn_max_iter", 3),
+            soinn_max_degree_for_removal=args.get("hcsoinn_soinn_max_degree_for_removal", 1),
+            # Lifecycle parameters
+            lifecycle_theta_support=lifecycle_theta_support,
+            lifecycle_theta_usage=lifecycle_theta_usage,
+            lifecycle_T_inactive=lifecycle_T_inactive,
+            lifecycle_min_alive_ratio=lifecycle_min_alive_ratio,
+            lifecycle_protect_old_topk=lifecycle_protect_old_topk,
+            lifecycle_node_inactive_threshold=lifecycle_node_inactive_threshold,
+            # --- Enable dictionary coding ---
+            use_dict_coding=args.get("use_dict_coding", True),
+            dict_sparse_k=dict_sparse_k,
+            dict_ridge_lambda=dict_ridge_lambda,
+            drop_node_raw_after_dict_materialize=drop_node_raw_after_dict_materialize,
+            # --- Dictionary growth parameters ---
+            theta_residual=dict_theta_residual,
+            max_growth_per_task=dict_max_growth_per_task,
+            # --- Direction 1: raw-node fallback gate ---
+            use_raw_fallback_gate=use_raw_fallback_gate,
+            raw_fallback_per_class=raw_fallback_per_class,
+            raw_fallback_select_by=raw_fallback_select_by,
+            fallback_gate_type=fallback_gate_type,
+            fallback_gate_margin_threshold=fallback_gate_margin_threshold,
+            fallback_gate_residual_threshold=fallback_gate_residual_threshold,
+            fallback_gate_random_rate=fallback_gate_random_rate,
+            fallback_memory_accounting=fallback_memory_accounting,
+            fallback_calibration_samples_per_class=fallback_calibration_samples_per_class,
+            fallback_gate_min_positives=fallback_gate_min_positives,
+            fallback_gate_min_calibration_gain=fallback_gate_min_calibration_gain,
+            fallback_gate_max_rate=fallback_gate_max_rate,
+            fallback_gate_tree_estimators=fallback_gate_tree_estimators,
+            fallback_gate_tree_max_depth=fallback_gate_tree_max_depth,
+            fallback_gate_tree_min_samples_leaf=fallback_gate_tree_min_samples_leaf,
+            fallback_gate_threshold_strategy=fallback_gate_threshold_strategy,
+            fallback_gate_min_precision=fallback_gate_min_precision,
+            fallback_gate_min_selected=fallback_gate_min_selected,
+            fallback_gate_min_net_count=fallback_gate_min_net_count,
+            fallback_candidate_rule=fallback_candidate_rule,
+            fallback_gate_budget_rates=fallback_gate_budget_rates,
+            fallback_gate_neutral_weight=fallback_gate_neutral_weight,
+            fallback_pair_table_mode=fallback_pair_table_mode,
+            fallback_pair_table_smoothing=fallback_pair_table_smoothing,
+            fallback_pair_table_lambda=fallback_pair_table_lambda,
+            fallback_node_table_lambda=fallback_node_table_lambda,
+            enable_prediction_trace=enable_prediction_trace,
+            trace_split=trace_split,
+            fallback_random_seed=args.get("fallback_random_seed", args.get("seed", 0)),
+        )
+
+        # --- P0-4: Apply ablation switches (override defaults from HCSOINNClassifier) ---
+        self.hc_soinn.use_dictionary_growth = bool(use_dictionary_growth)
+        self.hc_soinn.use_lifecycle = bool(use_lifecycle)
+        self.hc_soinn.use_protected_gate = bool(use_protected_gate)
+        self.hc_soinn.use_edge_age_persistence = bool(use_edge_age_persistence)
+        self.hc_soinn.use_edge_aware_scoring = bool(use_edge_aware_scoring)
+        self.hc_soinn.edge_score_gamma = float(edge_score_gamma)
+        self.hc_soinn.edge_score_eta = float(edge_score_eta)
+        self._hc_soinn_compressed_for_task = False
+        self._fallback_calibration_cumulative = bool(fallback_calibration_cumulative)
+        self._fallback_calibration_datasets = []
+        self._prediction_trace_output_dir = args.get("prediction_trace_output_dir", None)
+        self._prediction_trace_dump_all_tasks = bool(
+            args.get("prediction_trace_dump_all_tasks", True)
+        )
+
+        logging.info(
+            f"[LifeTopoDict] Initialized with dict_sparse_k={dict_sparse_k}, "
+            f"dict_ridge_lambda={dict_ridge_lambda}, "
+            f"lifecycle_theta_support={lifecycle_theta_support}, "
+            f"lifecycle_theta_usage={lifecycle_theta_usage}, "
+            f"lifecycle_T_inactive={lifecycle_T_inactive}, "
+            f"lifecycle_min_alive_ratio={lifecycle_min_alive_ratio}, "
+            f"lifecycle_protect_old_topk={lifecycle_protect_old_topk}, "
+            f"lifecycle_node_inactive_threshold={lifecycle_node_inactive_threshold}, "
+            f"drop_node_raw_after_dict_materialize={drop_node_raw_after_dict_materialize}, "
+            f"dict_theta_residual={dict_theta_residual}, "
+            f"dict_max_growth_per_task={dict_max_growth_per_task}, "
+            f"use_dictionary_growth={use_dictionary_growth}, "
+            f"use_lifecycle={use_lifecycle}, "
+            f"use_protected_gate={use_protected_gate}, "
+            f"use_edge_age_persistence={use_edge_age_persistence}, "
+            f"use_edge_aware_scoring={use_edge_aware_scoring}, "
+            f"edge_score_gamma={edge_score_gamma}, "
+            f"edge_score_eta={edge_score_eta}, "
+            f"use_raw_fallback_gate={use_raw_fallback_gate}, "
+            f"raw_fallback_per_class={raw_fallback_per_class}, "
+            f"raw_fallback_select_by={raw_fallback_select_by}, "
+            f"fallback_gate_type={fallback_gate_type}, "
+            f"fallback_gate_margin_threshold={fallback_gate_margin_threshold}, "
+            f"fallback_gate_residual_threshold={fallback_gate_residual_threshold}, "
+            f"fallback_gate_random_rate={fallback_gate_random_rate}, "
+            f"fallback_memory_accounting={fallback_memory_accounting}, "
+            f"fallback_calibration_samples_per_class={fallback_calibration_samples_per_class}, "
+            f"fallback_calibration_cumulative={fallback_calibration_cumulative}, "
+            f"fallback_gate_min_positives={fallback_gate_min_positives}, "
+            f"fallback_gate_min_calibration_gain={fallback_gate_min_calibration_gain}, "
+            f"fallback_gate_max_rate={fallback_gate_max_rate}, "
+            f"fallback_gate_tree_estimators={fallback_gate_tree_estimators}, "
+            f"fallback_gate_tree_max_depth={fallback_gate_tree_max_depth}, "
+            f"fallback_gate_tree_min_samples_leaf={fallback_gate_tree_min_samples_leaf}, "
+            f"fallback_gate_threshold_strategy={fallback_gate_threshold_strategy}, "
+            f"fallback_gate_min_precision={fallback_gate_min_precision}, "
+            f"fallback_gate_min_selected={fallback_gate_min_selected}, "
+            f"fallback_gate_min_net_count={fallback_gate_min_net_count}, "
+            f"fallback_candidate_rule={fallback_candidate_rule}, "
+            f"fallback_gate_budget_rates={fallback_gate_budget_rates}, "
+            f"fallback_gate_neutral_weight={fallback_gate_neutral_weight}, "
+            f"fallback_pair_table_mode={fallback_pair_table_mode}, "
+            f"fallback_pair_table_smoothing={fallback_pair_table_smoothing}, "
+            f"fallback_pair_table_lambda={fallback_pair_table_lambda}, "
+            f"fallback_node_table_lambda={fallback_node_table_lambda}, "
+            f"enable_prediction_trace={enable_prediction_trace}, "
+            f"trace_split={trace_split}, "
+            f"prediction_trace_output_dir={self._prediction_trace_output_dir}, "
+            f"prediction_trace_dump_all_tasks={self._prediction_trace_dump_all_tasks}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Task boundary: compress triggers dict coding, growth, lifecycle     #
+    # ------------------------------------------------------------------ #
+    def _compress_task_boundary(self):
+        if self._hc_soinn_compressed_for_task:
+            return
+        try:
+            if hasattr(self.hc_soinn, "set_task_boundary"):
+                self.hc_soinn.set_task_boundary(self._known_classes)
+            self.hc_soinn.compress()
+            self._hc_soinn_compressed_for_task = True
+        except Exception as e:
+            logging.error(f"[LifeTopoDict] compress error: {e}", exc_info=True)
+
+    def after_task(self):
+        if not self._hc_soinn_compressed_for_task:
+            self._compress_task_boundary()
+
+        # Output memory report after compress
+        diag = self.hc_soinn.compute_diagnostics()
+        mem = diag.get('memory', {})
+        edge_stats = diag.get('edge_score_stats', {})
+        logging.info(
+            f"[LifeTopoDict] Memory: compact={mem.get('compact_deployable_mb', 0):.4f} MB, "
+            f"actual={mem.get('actual_implementation_mb', 0):.4f} MB, "
+            f"atoms={mem.get('atoms_mb', 0):.4f} MB, "
+            f"coeffs={mem.get('coefficients_mb', 0):.4f} MB, "
+            f"edges={mem.get('edges_mb', 0):.4f} MB, "
+            f"edge_rel={mem.get('edge_reliability_mb', 0):.4f} MB, "
+            f"fallback={mem.get('raw_fallback_total_mb', 0):.4f} MB, "
+            f"fallback_gate={mem.get('raw_fallback_gate_model_mb', 0):.4f} MB, "
+            f"caches={mem.get('caches_mb', 0):.4f} MB, "
+            f"buffers={mem.get('buffers_mb', 0):.4f} MB, "
+            f"frozen={mem.get('frozen_mb', 0):.4f} MB"
+        )
+        fallback_stats = diag.get('raw_fallback_stats', {})
+        if fallback_stats:
+            logging.info(
+                f"[LifeTopoDict] Raw fallback: enabled={int(fallback_stats.get('fallback_enabled', 0))}, "
+                f"cache_nodes={int(fallback_stats.get('fallback_cache_nodes', 0))}, "
+                f"cache_classes={int(fallback_stats.get('fallback_cache_classes', 0))}, "
+                f"rate={fallback_stats.get('fallback_rate', 0):.4f}, "
+                f"available={fallback_stats.get('fallback_available_rate', 0):.4f}, "
+                f"change={fallback_stats.get('fallback_prediction_change_rate', 0):.4f}, "
+                f"disagree={fallback_stats.get('compact_raw_disagreement', 0):.4f}, "
+                f"compact_acc={fallback_stats.get('compact_accuracy', 0):.4f}, "
+                f"fallback_acc={fallback_stats.get('fallback_accuracy', 0):.4f}, "
+                f"final_acc={fallback_stats.get('final_accuracy', 0):.4f}, "
+                f"used_compact_acc={fallback_stats.get('compact_correct_when_used', 0):.4f}, "
+                f"used_fallback_acc={fallback_stats.get('fallback_correct_when_used', 0):.4f}, "
+                f"oracle_improvable={fallback_stats.get('oracle_improvable_rate', 0):.4f}, "
+                f"benefit={fallback_stats.get('benefit_rate', 0):.4f}, "
+                f"harm={fallback_stats.get('harm_rate', 0):.4f}, "
+                f"net={fallback_stats.get('net_gain_rate', 0):.4f}, "
+                f"benefit_sel={fallback_stats.get('benefit_selected', 0):.0f}, "
+                f"harm_sel={fallback_stats.get('harm_selected', 0):.0f}, "
+                f"precision={fallback_stats.get('utility_precision', 0):.4f}, "
+                f"benefit_recall={fallback_stats.get('benefit_recall', 0):.4f}, "
+                f"margin_mean={fallback_stats.get('trace_margin_mean', 0):.4f}, "
+                f"residual_mean={fallback_stats.get('trace_residual_mean', 0):.4f}, "
+                f"used_margin_mean={fallback_stats.get('fallback_margin_mean', 0):.4f}, "
+                f"used_residual_mean={fallback_stats.get('fallback_residual_mean', 0):.4f}"
+            )
+        fallback_gate_stats = diag.get('raw_fallback_gate_stats', {})
+        if fallback_gate_stats:
+            logging.info(
+                f"[LifeTopoDict] Raw fallback gate fit: samples={int(fallback_gate_stats.get('samples', 0))}, "
+                f"positives={int(fallback_gate_stats.get('positives', 0))}, "
+                f"pos_rate={fallback_gate_stats.get('positive_rate', 0):.4f}, "
+                f"calib_acc={fallback_gate_stats.get('calibration_accuracy', 0):.4f}, "
+                f"compact_acc={fallback_gate_stats.get('compact_accuracy', 0):.4f}, "
+                f"fallback_acc={fallback_gate_stats.get('fallback_accuracy', 0):.4f}, "
+                f"oracle_acc={fallback_gate_stats.get('oracle_accuracy', 0):.4f}, "
+                f"gain={fallback_gate_stats.get('calibration_gain', 0):.4f}, "
+                f"net={fallback_gate_stats.get('calibration_net_gain', 0):.4f}, "
+                f"fallback_rate={fallback_gate_stats.get('calibration_fallback_rate', 0):.4f}, "
+                f"benefit_sel={fallback_gate_stats.get('calibration_benefit_selected', 0):.0f}, "
+                f"harm_sel={fallback_gate_stats.get('calibration_harm_selected', 0):.0f}, "
+                f"precision={fallback_gate_stats.get('calibration_utility_precision', 0):.4f}, "
+                f"candidate_rate={fallback_gate_stats.get('candidate_rate', 0):.4f}, "
+                f"threshold={fallback_gate_stats.get('threshold', 0):.6f}, "
+                f"weight_l2={fallback_gate_stats.get('weight_l2', 0):.4f}, "
+                f"disabled={int(fallback_gate_stats.get('gate_disabled', 0))}"
+            )
+        if edge_stats:
+            logging.info(
+                f"[LifeTopoDict] Edge scoring: use_rate={edge_stats.get('edge_use_rate', 0):.4f}, "
+                f"class_use_rate={edge_stats.get('edge_class_use_rate', 0):.4f}, "
+                f"margin_contribution={edge_stats.get('edge_margin_contribution', 0):.4f}, "
+                f"risk_penalty={edge_stats.get('edge_risk_penalty', 0):.4f}, "
+                f"avg_adjustment={edge_stats.get('edge_score_adjustment', 0):.4f}"
+            )
+
+        self._known_classes = self._total_classes
+        self._hc_soinn_compressed_for_task = False
+
+    # ------------------------------------------------------------------ #
+    # Feature extraction for HC-SOINN                                     #
+    # ------------------------------------------------------------------ #
+    def _extract_class_features(self, loader, model):
+        feats, lbs = [], []
+        from_cache = is_cached_feature_loader(loader)
+        if not from_cache and model is None:
+            raise RuntimeError(
+                "Backbone is skipped, but train_loader_for_hc is not backed by cached features."
+            )
+        if model is not None:
+            model.eval()
+        with torch.no_grad():
+            for _, data, label in loader:
+                if from_cache:
+                    emb = data.float()
+                else:
+                    data = data.to(self._device)
+                    if isinstance(model, nn.DataParallel):
+                        emb = model.module.extract_vector(data)
+                    else:
+                        emb = model.extract_vector(data)
+                feats.append(emb.cpu())
+                lbs.append(label.cpu())
+
+        if len(feats) == 0:
+            return
+        feats = torch.cat(feats, dim=0).numpy()
+        lbs = torch.cat(lbs, dim=0).numpy()
+        self.hc_soinn.add_features(feats, lbs)
+
+        proto_info = self.hc_soinn.prototypes_per_class()
+        logging.info(f"[LifeTopoDict] prototypes per class: {proto_info}")
+
+    # ------------------------------------------------------------------ #
+    # Incremental training                                                #
+    # ------------------------------------------------------------------ #
+    def incremental_train(self, data_manager):
+        logging.info(
+            f"[LifeTopoDict] Starting incremental_train: cur_task={self._cur_task}, "
+            f"known_classes={self._known_classes}"
+        )
+        self._hc_soinn_compressed_for_task = False
+        self._cur_task += 1
+        self._total_classes = self._known_classes + data_manager.get_task_size(
+            self._cur_task
+        )
+        logging.info(
+            f"[LifeTopoDict] After update: cur_task={self._cur_task}, "
+            f"total_classes={self._total_classes}, known_classes={self._known_classes}"
+        )
+        logging.info(
+            "Learning on {}-{}".format(self._known_classes, self._total_classes)
+        )
+
+        train_dataset = data_manager.get_dataset(
+            np.arange(self._known_classes, self._total_classes),
+            source="train",
+            mode="train",
+        )
+        self.train_dataset = train_dataset
+        self.data_manager = data_manager
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+        )
+
+        fallback_calibration_loader = None
+
+        test_dataset = get_cached_feature_dataset(
+            self.args,
+            data_manager,
+            np.arange(0, self._total_classes),
+            source="test",
+        )
+        if test_dataset is None:
+            test_dataset = data_manager.get_dataset(
+                np.arange(0, self._total_classes), source="test", mode="test"
+            )
+        self.test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+        )
+
+        train_dataset_for_hc = get_cached_feature_dataset(
+            self.args,
+            data_manager,
+            np.arange(self._known_classes, self._total_classes),
+            source="train",
+        )
+        learned_gate_types = (
+            "ridge", "logistic", "gbdt", "gbdt_depth2", "random_forest", "rf", "rf_depth4",
+            "candidate_rule", "delta_ridge", "delta_logistic", "benefit_harm_logistic",
+            "dual_logistic", "dual_logistic_lcb", "utility_tree", "utility_gbdt",
+            "utility_table", "delta_ridge_pair",
+        )
+        learned_fallback_gate = (
+            bool(self.hc_soinn.use_raw_fallback_gate)
+            and str(getattr(self.hc_soinn, "fallback_gate_type", "rule")).lower() in learned_gate_types
+            and int(getattr(self.hc_soinn, "fallback_calibration_samples_per_class", 0)) > 0
+        )
+        calibration_samples_per_class = int(
+            getattr(self.hc_soinn, "fallback_calibration_samples_per_class", 0)
+        )
+        if learned_fallback_gate:
+            if train_dataset_for_hc is not None:
+                train_dataset_for_hc, fallback_calibration_dataset = get_cached_feature_dataset_split(
+                    self.args,
+                    data_manager,
+                    np.arange(self._known_classes, self._total_classes),
+                    source="train",
+                    val_samples_per_class=calibration_samples_per_class,
+                )
+            else:
+                train_dataset_for_hc, fallback_calibration_dataset = data_manager.get_dataset_with_split(
+                    np.arange(self._known_classes, self._total_classes),
+                    source="train",
+                    mode="test",
+                    val_samples_per_class=calibration_samples_per_class,
+                )
+            if fallback_calibration_dataset is not None:
+                if self._fallback_calibration_cumulative:
+                    self._fallback_calibration_datasets.append(fallback_calibration_dataset)
+                    if len(self._fallback_calibration_datasets) == 1:
+                        fallback_calibration_dataset = self._fallback_calibration_datasets[0]
+                    else:
+                        fallback_calibration_dataset = ConcatDataset(
+                            list(self._fallback_calibration_datasets)
+                        )
+                fallback_calibration_loader = DataLoader(
+                    fallback_calibration_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                )
+        else:
+            fallback_calibration_dataset = None
+        if train_dataset_for_hc is None:
+            train_dataset_for_hc = data_manager.get_dataset(
+                np.arange(self._known_classes, self._total_classes),
+                source="train",
+                mode="test",
+            )
+        self.train_loader_for_hc = DataLoader(
+            train_dataset_for_hc,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+        )
+        log_feature_cache_loader(self.train_loader_for_hc, "train_loader_for_hc")
+        log_feature_cache_loader(self.test_loader, "test_loader")
+        if fallback_calibration_loader is not None:
+            log_feature_cache_loader(fallback_calibration_loader, "fallback_calibration_loader")
+
+        if len(self._multiple_gpus) > 1 and self._network is not None:
+            logging.info("Using multiple GPUs")
+            self._network = nn.DataParallel(self._network, self._multiple_gpus)
+
+        self._train(
+            self.train_loader,
+            self.test_loader,
+            self.train_loader_for_hc,
+            fallback_calibration_loader=fallback_calibration_loader,
+        )
+
+        if len(self._multiple_gpus) > 1 and self._network is not None:
+            self._network = self._network.module
+
+    def _train(self, train_loader, test_loader, train_loader_for_hc, fallback_calibration_loader=None):
+        if self._network is not None:
+            self._network.to(self._device)
+        self._extract_class_features(train_loader_for_hc, self._network)
+        self._compress_task_boundary()
+        self._calibrate_raw_fallback_gate(fallback_calibration_loader)
+
+    def _calibrate_raw_fallback_gate(self, calibration_loader):
+        if calibration_loader is None:
+            return
+        if not hasattr(self.hc_soinn, "fit_raw_fallback_gate_from_trace"):
+            return
+        gate_type = str(getattr(self.hc_soinn, "fallback_gate_type", "rule")).lower()
+        if gate_type not in (
+            "ridge", "logistic", "gbdt", "gbdt_depth2", "random_forest", "rf", "rf_depth4",
+            "candidate_rule", "delta_ridge", "delta_logistic", "benefit_harm_logistic",
+            "dual_logistic", "dual_logistic_lcb", "utility_tree", "utility_gbdt",
+            "utility_table", "delta_ridge_pair",
+        ):
+            return
+        logging.info(
+            "[LifeTopoDict] Calibrating raw fallback gate on %d samples (type=%s, trace_split=%s).",
+            len(calibration_loader.dataset),
+            gate_type,
+            getattr(self.hc_soinn, "trace_split", "test"),
+        )
+        _ = self._eval_cnn(calibration_loader)
+        trace_records = self.hc_soinn.get_prediction_trace()
+        self._dump_prediction_trace_records(trace_records, split="calibration")
+        fit_stats = self.hc_soinn.fit_raw_fallback_gate_from_trace(trace_records)
+        if fit_stats:
+            logging.info(
+                "[LifeTopoDict] Raw fallback gate fit: samples=%d, positives=%.0f, "
+                "calib_acc=%.4f, compact_acc=%.4f, fallback_acc=%.4f, oracle_acc=%.4f, "
+                "gain=%.4f, net=%.4f, fallback_rate=%.4f, benefit_sel=%.0f, harm_sel=%.0f, "
+                "precision=%.4f, threshold=%.6f, weight_l2=%.4f, disabled=%d",
+                int(fit_stats.get("samples", 0.0)),
+                float(fit_stats.get("positives", 0.0)),
+                float(fit_stats.get("calibration_accuracy", 0.0)),
+                float(fit_stats.get("compact_accuracy", 0.0)),
+                float(fit_stats.get("fallback_accuracy", 0.0)),
+                float(fit_stats.get("oracle_accuracy", 0.0)),
+                float(fit_stats.get("calibration_gain", 0.0)),
+                float(fit_stats.get("calibration_net_gain", 0.0)),
+                float(fit_stats.get("calibration_fallback_rate", 0.0)),
+                float(fit_stats.get("calibration_benefit_selected", 0.0)),
+                float(fit_stats.get("calibration_harm_selected", 0.0)),
+                float(fit_stats.get("calibration_utility_precision", 0.0)),
+                float(fit_stats.get("threshold", 0.0)),
+                float(fit_stats.get("weight_l2", 0.0)),
+                int(fit_stats.get("gate_disabled", 0.0)),
+            )
+
+    # ------------------------------------------------------------------ #
+    # Evaluation / inference                                              #
+    # ------------------------------------------------------------------ #
+    def _eval_cnn(self, loader):
+        y_pred, y_true = [], []
+        if hasattr(self.hc_soinn, "reset_raw_fallback_eval_stats"):
+            self.hc_soinn.reset_raw_fallback_eval_stats(clear_trace=True)
+        from_cache = is_cached_feature_loader(loader)
+        if not from_cache and self._network is None:
+            raise RuntimeError(
+                "Backbone is skipped, but test_loader is not backed by cached features."
+            )
+        if self._network is not None:
+            self._network.eval()
+
+        with torch.no_grad():
+            for _, (_, inputs, targets) in enumerate(loader):
+                if from_cache:
+                    features = tensor2numpy(inputs.float())
+                else:
+                    inputs = inputs.to(self._device)
+                    features = self._network.extract_vector(inputs)
+                    features = tensor2numpy(features)
+
+                topk_pred = self.hc_soinn.predict_topk(
+                    features,
+                    self.topk,
+                    self._total_classes,
+                    device=self._classifier_device,
+                    targets=targets.numpy(),
+                )
+                y_pred.append(topk_pred)
+                y_true.append(targets.numpy())
+
+        return np.concatenate(y_pred), np.concatenate(y_true)
+
+    def eval_task(self):
+        y_pred, y_true = self._eval_cnn(self.test_loader)
+        self._dump_prediction_trace(split="test")
+        acc = self._evaluate(y_pred, y_true)
+        return {"hc_soinn": acc}
+
+    def _json_safe(self, value):
+        if isinstance(value, np.generic):
+            return self._json_safe(value.item())
+        if isinstance(value, np.ndarray):
+            return [self._json_safe(v) for v in value.tolist()]
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): self._json_safe(v) for k, v in value.items()}
+        if isinstance(value, float):
+            if not np.isfinite(value):
+                return None
+            return value
+        return value
+
+    def _dump_prediction_trace(self, split="test"):
+        output_dir = self._prediction_trace_output_dir
+        if not output_dir:
+            return
+        if not bool(getattr(self.hc_soinn, "enable_prediction_trace", False)):
+            return
+        if not self._prediction_trace_dump_all_tasks:
+            # Without a reliable final-task callback here, the default keeps all
+            # task traces. This branch is reserved for future explicit callers.
+            return
+
+        records = self.hc_soinn.get_prediction_trace()
+        if not records:
+            logging.info("[PredictionTrace] No records to dump for task=%s", self._cur_task)
+            return
+
+        trace_split = str(getattr(self.hc_soinn, "trace_split", split))
+        self._dump_prediction_trace_records(records, split=trace_split)
+
+    def _dump_prediction_trace_records(self, records, split="test"):
+        output_dir = self._prediction_trace_output_dir
+        if not output_dir:
+            return
+        if not bool(getattr(self.hc_soinn, "enable_prediction_trace", False)):
+            return
+        if not records:
+            return
+
+        os.makedirs(output_dir, exist_ok=True)
+        prefix = str(self.args.get("prefix", "life_topo_dict"))
+        dataset = str(self.args.get("dataset", "dataset"))
+        seed = str(self.args.get("seed", "seed"))
+        trace_split = str(split)
+        filename = (
+            f"{dataset}_{prefix}_seed{seed}_task{self._cur_task:02d}_"
+            f"classes{self._total_classes}_{trace_split}.jsonl"
+        )
+        path = os.path.join(output_dir, filename)
+        metadata = {
+            "dataset": dataset,
+            "prefix": prefix,
+            "seed": self.args.get("seed", None),
+            "task": int(self._cur_task),
+            "known_classes": int(self._known_classes),
+            "total_classes": int(self._total_classes),
+            "init_cls": int(self.args.get("init_cls", 0)),
+            "increment": int(self.args.get("increment", 0)),
+            "trace_split": trace_split,
+            "fallback_gate_type": str(getattr(self.hc_soinn, "fallback_gate_type", "")),
+            "raw_fallback_per_class": int(getattr(self.hc_soinn, "raw_fallback_per_class", 0)),
+            "raw_fallback_select_by": str(getattr(self.hc_soinn, "raw_fallback_select_by", "")),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            for idx, record in enumerate(records):
+                out = dict(metadata)
+                out["sample_index"] = int(idx)
+                out.update(record)
+                f.write(json.dumps(self._json_safe(out), ensure_ascii=False) + "\n")
+        logging.info(
+            "[PredictionTrace] Dumped %d records to %s",
+            len(records),
+            path,
+        )

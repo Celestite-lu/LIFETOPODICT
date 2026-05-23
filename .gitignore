@@ -1,0 +1,16 @@
+data/
+logs/
+checkpoints/
+.idea/
+__pycache__/
+*.py[cod]
+*.ipynb
+*.pdf
+resources/
+procrustes_analysis/
+
+# Paper extraction artifacts. Keep paper summaries/markdown, ignore heavy derived assets.
+docs/paper/**/Origin_Paper/**/images/
+docs/paper/**/Origin_Paper/**/*_content_list*.json
+docs/paper/**/Origin_Paper/**/*_model.json
+docs/paper/**/Origin_Paper/**/layout.json
