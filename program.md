@@ -35,8 +35,8 @@ Current compact LifeTopoDict selected reference:
 Minimum publishable success:
 
 ```text
-CUB 3-seed mean A_Last >= raw HC-SOINN A_Last + 0.10pp
-A_Avg >= raw HC-SOINN A_Avg - 0.10pp
+CUB 3-seed mean A_Last >= raw HC-SOINN A_Last + 1.50pp
+A_Avg >= raw HC-SOINN A_Avg
 Old-New HM >= raw HC-SOINN HM, or a clear A_Last gain explains any HM tradeoff
 compact deployable memory reduction vs raw >= 30%
 actual implementation memory <= raw HC-SOINN
@@ -45,9 +45,9 @@ actual implementation memory <= raw HC-SOINN
 Strong success:
 
 ```text
-CUB 3-seed mean A_Last >= raw HC-SOINN A_Last + 0.30pp
+CUB 3-seed mean A_Last >= raw HC-SOINN A_Last + 3.00pp
 A_Avg >= raw HC-SOINN A_Avg
-Old-New HM >= raw HC-SOINN HM + 0.20pp
+Old-New HM >= raw HC-SOINN HM + 1.00pp, or A_Last gain is large enough to justify the tradeoff
 compact deployable memory reduction vs raw >= 40%
 method beats random/static/same-memory controls
 ```
@@ -428,8 +428,8 @@ python scripts/collect_results.py logs/life_topo_dict/cub/0/10 \
 Single-seed keep threshold:
 
 ```text
-selected-relative A_Last >= +0.20pp
-A_Avg drop vs selected <= 0.10pp
+raw-relative A_Last >= +1.00pp, or selected-relative A_Last >= +1.50pp with a clear path to raw-relative gain
+A_Avg >= raw HC-SOINN A_Avg - 0.10pp
 test/calibration diagnostics do not indicate label leakage or severe overfit
 memory reduction vs raw remains >= 30%
 ```
@@ -437,8 +437,8 @@ memory reduction vs raw remains >= 30%
 If the idea targets HM rather than A_Last:
 
 ```text
-Old-New HM improves by >= +0.20pp
-A_Last drop <= 0.10pp
+Old-New HM improves by >= +1.00pp
+A_Last >= raw HC-SOINN A_Last - 0.10pp
 random/high-usage controls do not explain the gain
 ```
 
@@ -557,8 +557,8 @@ Do not overclaim:
 
 Prefer simpler mechanisms:
 
-- A rule or small table with +0.2pp stable gain is better than a complex model with +0.25pp and high variance.
-- A no-extra-memory calibration that matches raw is valuable.
+- A rule or small table with a stable +1.5pp gain is better than a complex model with a fragile +2.0pp gain.
+- A no-extra-memory calibration that only matches raw is diagnostic, not a final success.
 - If two methods tie, keep the one with less memory and fewer moving parts.
 
 Always report both:
