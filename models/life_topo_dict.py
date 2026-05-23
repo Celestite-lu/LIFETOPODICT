@@ -122,6 +122,9 @@ class Learner(BaseLearner):
         use_node_residual_penalty = args.get("use_node_residual_penalty", False)
         node_residual_penalty_strength = args.get("node_residual_penalty_strength", 0.0)
         node_residual_penalty_mode = args.get("node_residual_penalty_mode", "linear")
+        use_node_residual_repair = args.get("use_node_residual_repair", False)
+        node_residual_repair_per_class = args.get("node_residual_repair_per_class", 0)
+        node_residual_repair_select_by = args.get("node_residual_repair_select_by", "residual")
         use_class_score_normalization = args.get("use_class_score_normalization", False)
         class_score_norm_mode = args.get("class_score_norm_mode", "affine")
         class_score_norm_strength = args.get("class_score_norm_strength", 1.0)
@@ -218,6 +221,9 @@ class Learner(BaseLearner):
             use_node_residual_penalty=use_node_residual_penalty,
             node_residual_penalty_strength=node_residual_penalty_strength,
             node_residual_penalty_mode=node_residual_penalty_mode,
+            use_node_residual_repair=use_node_residual_repair,
+            node_residual_repair_per_class=node_residual_repair_per_class,
+            node_residual_repair_select_by=node_residual_repair_select_by,
             use_class_score_normalization=use_class_score_normalization,
             class_score_norm_mode=class_score_norm_mode,
             class_score_norm_strength=class_score_norm_strength,
@@ -314,6 +320,9 @@ class Learner(BaseLearner):
             f"use_node_residual_penalty={use_node_residual_penalty}, "
             f"node_residual_penalty_strength={node_residual_penalty_strength}, "
             f"node_residual_penalty_mode={node_residual_penalty_mode}, "
+            f"use_node_residual_repair={use_node_residual_repair}, "
+            f"node_residual_repair_per_class={node_residual_repair_per_class}, "
+            f"node_residual_repair_select_by={node_residual_repair_select_by}, "
             f"use_class_score_normalization={use_class_score_normalization}, "
             f"class_score_norm_mode={class_score_norm_mode}, "
             f"class_score_norm_strength={class_score_norm_strength}, "
@@ -362,6 +371,7 @@ class Learner(BaseLearner):
             f"atom_gate={mem.get('atom_conflict_gate_model_mb', 0):.4f} MB, "
             f"score_bias={mem.get('score_bias_model_mb', 0):.4f} MB, "
             f"residual_penalty={mem.get('node_residual_penalty_model_mb', 0):.4f} MB, "
+            f"residual_repair={mem.get('node_residual_repair_model_mb', 0):.4f} MB, "
             f"raw_aux={mem.get('raw_auxiliary_model_mb', 0):.4f} MB, "
             f"class_score_norm={mem.get('class_score_normalization_model_mb', 0):.4f} MB, "
             f"node_density={mem.get('node_density_scoring_model_mb', 0):.4f} MB, "
@@ -412,6 +422,18 @@ class Learner(BaseLearner):
                 f"benefit={raw_auxiliary_stats.get('raw_auxiliary_benefit_selected', 0):.0f}, "
                 f"harm={raw_auxiliary_stats.get('raw_auxiliary_harm_selected', 0):.0f}, "
                 f"net={raw_auxiliary_stats.get('raw_auxiliary_net_gain_rate', 0):.4f}"
+            )
+        residual_repair_stats = diag.get('node_residual_repair_stats', {})
+        if residual_repair_stats:
+            logging.info(
+                f"[LifeTopoDict] Node residual repair: "
+                f"enabled={int(residual_repair_stats.get('node_residual_repair_enabled', 0))}, "
+                f"per_class={int(residual_repair_stats.get('node_residual_repair_per_class', 0))}, "
+                f"nodes={int(residual_repair_stats.get('node_residual_repair_nodes', 0))}, "
+                f"active_nodes={int(residual_repair_stats.get('node_residual_repair_active_nodes', 0))}, "
+                f"rate={residual_repair_stats.get('node_residual_repair_rate', 0):.4f}, "
+                f"repair_residual_mean={residual_repair_stats.get('node_residual_repair_residual_mean', 0):.4f}, "
+                f"all_residual_mean={residual_repair_stats.get('node_residual_repair_all_residual_mean', 0):.4f}"
             )
         fallback_gate_stats = diag.get('raw_fallback_gate_stats', {})
         if fallback_gate_stats:

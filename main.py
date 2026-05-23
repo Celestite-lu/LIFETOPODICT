@@ -67,6 +67,8 @@ def main():
         'score_bias_min_gain',
         'use_node_residual_penalty', 'node_residual_penalty_strength',
         'node_residual_penalty_mode',
+        'use_node_residual_repair', 'node_residual_repair_per_class',
+        'node_residual_repair_select_by',
         'use_class_score_normalization', 'class_score_norm_mode',
         'class_score_norm_strength', 'class_score_norm_min_scale',
         'use_node_density_scoring', 'node_density_scoring_strength',
@@ -249,6 +251,12 @@ def setup_parser():
                         help='Strength for node residual distance penalty.')
     parser.add_argument('--node_residual_penalty_mode', type=str, default=None,
                         help='Node residual penalty mode: linear, sqrt, or random_control.')
+    parser.add_argument('--use_node_residual_repair', type=_str2bool, default=None,
+                        help='Use raw-normalized centers for a small budget of high-residual compact nodes.')
+    parser.add_argument('--node_residual_repair_per_class', type=int, default=None,
+                        help='Number of nodes per class to repair with raw centers.')
+    parser.add_argument('--node_residual_repair_select_by', type=str, default=None,
+                        help='Residual repair node ranking: residual, count, residual_count, low_residual, or random_control.')
     parser.add_argument('--use_class_score_normalization', type=_str2bool, default=None,
                         help='Normalize compact HC-SOINN scores with train-only per-class distance stats.')
     parser.add_argument('--class_score_norm_mode', type=str, default=None,

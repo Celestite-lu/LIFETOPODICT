@@ -57,6 +57,7 @@ class _Cluster:
         self.dict_recon_raw: Optional[np.ndarray] = (
             None if dict_recon_raw is None else dict_recon_raw.copy()
         )
+        self.residual_repaired: bool = False
             
 def _hierarchical_cluster(feats_norm: np.ndarray, feats_raw: np.ndarray, target_k: int, linkage_method: str, distance_metric: str) -> List[_Cluster]:
     """Handle hierarchical cluster."""
@@ -432,6 +433,10 @@ class HCSOINNClassifier:
         use_node_residual_penalty: bool = False,
         node_residual_penalty_strength: float = 0.0,
         node_residual_penalty_mode: str = "linear",
+        # --- Node residual geometry repair ---
+        use_node_residual_repair: bool = False,
+        node_residual_repair_per_class: int = 0,
+        node_residual_repair_select_by: str = "residual",
         # --- Compact score normalization ---
         use_class_score_normalization: bool = False,
         class_score_norm_mode: str = "affine",
@@ -566,6 +571,7 @@ class HCSOINNClassifier:
         self.raw_auxiliary_scope: str = str(raw_auxiliary_scope).lower()
         self.enable_prediction_trace: bool = bool(enable_prediction_trace)
         self.trace_split: str = str(trace_split)
+        self._fallback_random_seed: int = int(fallback_random_seed)
         self._raw_fallback_rng = np.random.RandomState(int(fallback_random_seed))
         self.raw_fallback_cache: Dict[int, List[Dict[str, object]]] = {}
         self._raw_fallback_cache_version: int = 0
@@ -620,6 +626,19 @@ class HCSOINNClassifier:
         self.use_node_residual_penalty: bool = bool(use_node_residual_penalty)
         self.node_residual_penalty_strength: float = float(node_residual_penalty_strength)
         self.node_residual_penalty_mode: str = str(node_residual_penalty_mode).lower()
+
+        # ------------------------------------------------------------------ #
+        # Node residual geometry repair. This keeps the compressed topology as
+        # the classifier base, but deploys raw centers for a small audited set
+        # of dictionary-distorted nodes.
+        # ------------------------------------------------------------------ #
+        self.use_node_residual_repair: bool = bool(use_node_residual_repair)
+        self.node_residual_repair_per_class: int = max(
+            0, int(node_residual_repair_per_class)
+        )
+        self.node_residual_repair_select_by: str = str(
+            node_residual_repair_select_by
+        ).lower()
 
         # ------------------------------------------------------------------ #
         # Class-wise compact score normalization. This stores robust positive
@@ -1062,6 +1081,61 @@ class HCSOINNClassifier:
             return residual + state_bonus + 0.01 * np.log1p(max(count, 0.0))
         return residual
 
+    def _stable_node_unit_score(self, cls: int, node_idx: int) -> float:
+        """Deterministic pseudo-random score for budget-matched controls."""
+        seed = int(getattr(self, "_fallback_random_seed", 0))
+        mixed = (
+            (int(cls) + 1) * 1000003
+            + (int(node_idx) + 1) * 9176
+            + seed * 1315423911
+        ) & 0xFFFFFFFF
+        return float(np.random.RandomState(mixed).rand())
+
+    def _node_residual_repair_candidate_score(self, cls: int, node_idx: int, node: _Cluster) -> float:
+        """Rank nodes for raw-center geometry repair using train-time metadata."""
+        select_by = str(getattr(self, "node_residual_repair_select_by", "residual")).lower()
+        residual = float(getattr(node, "residual", 0.0))
+        count = float(getattr(node, "count", 0.0))
+        if select_by in ("random", "random_control"):
+            return self._stable_node_unit_score(cls, node_idx)
+        if select_by == "count":
+            return count
+        if select_by in ("low_residual", "residual_low"):
+            return -residual
+        if select_by in ("residual_count", "residual_margin"):
+            return residual * np.log1p(max(count, 0.0))
+        return residual
+
+    def _select_node_residual_repair_keys(self) -> Set[Tuple[int, int]]:
+        """Select active materializable nodes whose deployed center uses raw geometry."""
+        if (
+            not bool(getattr(self, "use_node_residual_repair", False))
+            or int(getattr(self, "node_residual_repair_per_class", 0)) <= 0
+        ):
+            return set()
+
+        per_class = int(getattr(self, "node_residual_repair_per_class", 0))
+        selected: Set[Tuple[int, int]] = set()
+        for cls, clusters in self.class_clusters.items():
+            candidates: List[Tuple[float, int]] = []
+            for node_idx, node in enumerate(clusters):
+                if node.node_state == 'inactive':
+                    continue
+                if node.coeff is None:
+                    continue
+                if self._is_frozen_dict_node(cls, node):
+                    continue
+                if not isinstance(node.center_raw, np.ndarray):
+                    continue
+                score = self._node_residual_repair_candidate_score(cls, node_idx, node)
+                candidates.append((score, int(node_idx)))
+            if not candidates:
+                continue
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            for _, node_idx in candidates[:per_class]:
+                selected.add((int(cls), int(node_idx)))
+        return selected
+
     def _update_raw_fallback_cache(self, candidates: List[Dict[str, object]]) -> None:
         """Merge raw node snapshots into the audited fallback cache."""
         if self.raw_fallback_per_class <= 0:
@@ -1279,6 +1353,64 @@ class HCSOINNClassifier:
             total_bytes += 8.0
         return {
             "node_residual_penalty_model_bytes": total_bytes,
+        }
+
+    def _node_residual_repair_model_bytes(self) -> Dict[str, float]:
+        """Return deployable storage for raw-center repaired topology nodes."""
+        vector_bytes = 0.0
+        node_count = 0
+        metadata_bytes = 0.0
+        if bool(getattr(self, "use_node_residual_repair", False)):
+            for clusters in self.class_clusters.values():
+                for node in clusters:
+                    if not bool(getattr(node, "residual_repaired", False)):
+                        continue
+                    if isinstance(node.center, np.ndarray):
+                        vector_bytes += float(node.center.nbytes)
+                        node_count += 1
+                        metadata_bytes += 4.0  # node id / compact-node association metadata
+            # Per-class budget, selection mode id, and enable flag.
+            metadata_bytes += 8.0 * 3.0
+        total_bytes = vector_bytes + metadata_bytes
+        return {
+            "node_residual_repair_vector_bytes": vector_bytes,
+            "node_residual_repair_metadata_bytes": metadata_bytes,
+            "node_residual_repair_model_bytes": total_bytes,
+            "node_residual_repair_nodes": float(node_count),
+        }
+
+    def _summarize_node_residual_repair_stats(self) -> Dict[str, float]:
+        """Summarize residual-repaired node coverage for diagnostics."""
+        active_nodes = 0
+        repaired_nodes = 0
+        repaired_residuals: List[float] = []
+        all_residuals: List[float] = []
+        for clusters in self.class_clusters.values():
+            for node in clusters:
+                if node.node_state == 'inactive' or node.coeff is None:
+                    continue
+                active_nodes += 1
+                residual = float(getattr(node, "residual", 0.0))
+                all_residuals.append(residual)
+                if bool(getattr(node, "residual_repaired", False)):
+                    repaired_nodes += 1
+                    repaired_residuals.append(residual)
+        if not bool(getattr(self, "use_node_residual_repair", False)):
+            return {}
+        return {
+            "node_residual_repair_enabled": float(bool(getattr(self, "use_node_residual_repair", False))),
+            "node_residual_repair_per_class": float(getattr(self, "node_residual_repair_per_class", 0)),
+            "node_residual_repair_nodes": float(repaired_nodes),
+            "node_residual_repair_active_nodes": float(active_nodes),
+            "node_residual_repair_rate": (
+                float(repaired_nodes) / float(active_nodes) if active_nodes > 0 else 0.0
+            ),
+            "node_residual_repair_residual_mean": (
+                float(np.mean(repaired_residuals)) if repaired_residuals else 0.0
+            ),
+            "node_residual_repair_all_residual_mean": (
+                float(np.mean(all_residuals)) if all_residuals else 0.0
+            ),
         }
 
     def _raw_auxiliary_model_bytes(self) -> Dict[str, float]:
@@ -3234,6 +3366,8 @@ class HCSOINNClassifier:
 
         total_materialized = 0
         frozen_skipped = 0
+        repaired_nodes = 0
+        repair_keys = self._select_node_residual_repair_keys()
         raw_fallback_candidates: List[Dict[str, object]] = []
         capture_raw_fallback = bool(
             (
@@ -3271,10 +3405,20 @@ class HCSOINNClassifier:
 
                 a = node.coeff.ravel()  # (M,)
                 z = a @ D_hat           # [d]  unnormalised reconstruction
-                z_norm = np.linalg.norm(z)
-                if z_norm > 1e-8:
-                    node.center = (z / z_norm).astype(np.float32)
-                # else: degenerate — keep old centre
+                repaired = False
+                if (int(cls), int(node_idx)) in repair_keys and isinstance(node.center_raw, np.ndarray):
+                    raw_center = np.asarray(node.center_raw, dtype=np.float32)
+                    raw_norm = np.linalg.norm(raw_center)
+                    if raw_norm > 1e-8:
+                        node.center = (raw_center / raw_norm).astype(np.float32)
+                        repaired = True
+                        repaired_nodes += 1
+                if not repaired:
+                    z_norm = np.linalg.norm(z)
+                    if z_norm > 1e-8:
+                        node.center = (z / z_norm).astype(np.float32)
+                    # else: degenerate — keep old centre
+                node.residual_repaired = bool(repaired)
                 if self.drop_node_raw_after_dict_materialize:
                     # In P0 deployment/inference, the materialized center plus
                     # sparse code are sufficient.  Keeping both the original
@@ -3290,7 +3434,7 @@ class HCSOINNClassifier:
 
         logging.info(
             f"[LifeTopoDict] _materialize_nodes(): materialized {total_materialized} nodes, "
-            f"frozen_skipped={frozen_skipped}."
+            f"frozen_skipped={frozen_skipped}, residual_repaired={repaired_nodes}."
         )
         self.invalidate_cache()
 
@@ -3820,6 +3964,11 @@ class HCSOINNClassifier:
             residual_penalty_storage.get('node_residual_penalty_model_bytes', 0.0)
         )
         breakdown.update(residual_penalty_storage)
+        residual_repair_storage = self._node_residual_repair_model_bytes()
+        node_residual_repair_model_bytes = float(
+            residual_repair_storage.get('node_residual_repair_model_bytes', 0.0)
+        )
+        breakdown.update(residual_repair_storage)
         raw_auxiliary_storage = self._raw_auxiliary_model_bytes()
         raw_auxiliary_model_bytes = float(
             raw_auxiliary_storage.get('raw_auxiliary_model_bytes', 0.0)
@@ -3863,6 +4012,7 @@ class HCSOINNClassifier:
         compact += atom_conflict_gate_model_bytes
         compact += score_bias_model_bytes
         compact += node_residual_penalty_model_bytes
+        compact += node_residual_repair_model_bytes
         compact += raw_auxiliary_model_bytes
         compact += class_score_normalization_model_bytes
         compact += node_density_scoring_model_bytes
@@ -3998,6 +4148,7 @@ class HCSOINNClassifier:
         atom_gate_stats = dict(getattr(self, '_atom_conflict_gate_fit_stats', {}))
         atom_eval_stats = dict(getattr(self, '_atom_conflict_eval_stats', {}))
         class_score_norm_stats = dict(getattr(self, '_class_score_norm_fit_stats', {}))
+        node_residual_repair_stats = self._summarize_node_residual_repair_stats()
         if atom_gate_stats:
             samples_eval = float(atom_eval_stats.get('samples', 0.0))
             if samples_eval > 0.0:
@@ -4037,6 +4188,7 @@ class HCSOINNClassifier:
             'raw_fallback_gate_stats': fallback_gate_stats,
             'atom_conflict_gate_stats': atom_gate_stats,
             'class_score_normalization_stats': class_score_norm_stats,
+            'node_residual_repair_stats': node_residual_repair_stats,
         }
 
         logging.info(
