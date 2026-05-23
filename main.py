@@ -69,6 +69,8 @@ def main():
         'node_residual_penalty_mode',
         'use_class_score_normalization', 'class_score_norm_mode',
         'class_score_norm_strength', 'class_score_norm_min_scale',
+        'use_node_density_scoring', 'node_density_scoring_strength',
+        'node_density_scoring_mode', 'node_density_scoring_clip',
         'use_feature_cache', 'feature_cache_dir', 'feature_cache_strict',
         'feature_cache_dtype', 'feature_cache_skip_backbone',
         'feature_cache_classifier_device',
@@ -255,6 +257,14 @@ def setup_parser():
                         help='Interpolation strength for class score normalization.')
     parser.add_argument('--class_score_norm_min_scale', type=float, default=None,
                         help='Minimum positive-score scale used by class score normalization.')
+    parser.add_argument('--use_node_density_scoring', type=_str2bool, default=None,
+                        help='Adjust compact node distances with train-support density metadata.')
+    parser.add_argument('--node_density_scoring_strength', type=float, default=None,
+                        help='Strength for node-density distance adjustment.')
+    parser.add_argument('--node_density_scoring_mode', type=str, default=None,
+                        help='Node density mode: log_count, sqrt, or random_control.')
+    parser.add_argument('--node_density_scoring_clip', type=float, default=None,
+                        help='Absolute clipping bound for node-density adjustment before scaling.')
 
     # --- Direction 2: ATD-aware atom conflict gate ---
     parser.add_argument('--use_atom_conflict_gate', type=_str2bool, default=None,

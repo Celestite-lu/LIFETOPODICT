@@ -437,6 +437,11 @@ class HCSOINNClassifier:
         class_score_norm_mode: str = "affine",
         class_score_norm_strength: float = 1.0,
         class_score_norm_min_scale: float = 0.01,
+        # --- Compact node-density reliability scoring ---
+        use_node_density_scoring: bool = False,
+        node_density_scoring_strength: float = 0.0,
+        node_density_scoring_mode: str = "log_count",
+        node_density_scoring_clip: float = 2.0,
     ) -> None:
         self.max_prototypes_per_class = None if max_prototypes_per_class is None else int(
             max_prototypes_per_class
@@ -634,6 +639,15 @@ class HCSOINNClassifier:
         self.class_score_norm_ref_center: float = 0.0
         self.class_score_norm_ref_scale: float = 1.0
         self._class_score_norm_fit_stats: Dict[str, float] = {}
+
+        # ------------------------------------------------------------------ #
+        # Node-density reliability scoring. Uses existing per-node train
+        # support counts to adjust local compact-node competition.
+        # ------------------------------------------------------------------ #
+        self.use_node_density_scoring: bool = bool(use_node_density_scoring)
+        self.node_density_scoring_strength: float = float(node_density_scoring_strength)
+        self.node_density_scoring_mode: str = str(node_density_scoring_mode).lower()
+        self.node_density_scoring_clip: float = max(0.0, float(node_density_scoring_clip))
 
         # ------------------------------------------------------------------ #
         # LifeTopoDict: shared dictionary atoms and metadata
@@ -934,6 +948,32 @@ class HCSOINNClassifier:
         if strength >= 1.0 - 1e-12:
             return normalized
         return (1.0 - strength) * final_scores + strength * normalized
+
+    def _node_density_adjustment_values(
+        self,
+        count_t: torch.Tensor,
+        mean_count_t: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return per-prototype local-density distance adjustments."""
+        strength = float(getattr(self, "node_density_scoring_strength", 0.0))
+        if not bool(getattr(self, "use_node_density_scoring", False)) or abs(strength) <= 1e-12:
+            return torch.zeros_like(count_t, device=device, dtype=torch.float32)
+        count_t = torch.clamp(count_t.to(device=device, dtype=torch.float32), min=1e-6)
+        mean_count_t = torch.clamp(mean_count_t.to(device=device, dtype=torch.float32), min=1e-6)
+        mode = str(getattr(self, "node_density_scoring_mode", "log_count")).lower()
+        if mode in ("sqrt", "sqrt_count", "sqrt_inverse"):
+            values = torch.sqrt(mean_count_t / count_t) - 1.0
+        elif mode in ("random", "random_control"):
+            idx = torch.arange(count_t.numel(), device=device, dtype=torch.float32)
+            values = torch.remainder(torch.sin((idx + 1.0) * 12.9898) * 43758.5453, 1.0)
+            values = (values - 0.5) * 2.0
+        else:
+            values = torch.log(mean_count_t / count_t)
+        clip = float(getattr(self, "node_density_scoring_clip", 0.0))
+        if clip > 0.0:
+            values = torch.clamp(values, min=-clip, max=clip)
+        return values * strength
 
     # ================================================================== #
     # Direction 1: raw-node fallback cache and prediction trace           #
@@ -1261,6 +1301,17 @@ class HCSOINNClassifier:
             total_bytes += 8.0 * 4.0
         return {
             "class_score_normalization_model_bytes": total_bytes,
+        }
+
+    def _node_density_scoring_model_bytes(self) -> Dict[str, float]:
+        """Return storage bytes for node-density scoring inference scalars."""
+        total_bytes = 0.0
+        if bool(getattr(self, "use_node_density_scoring", False)):
+            # Strength, clip, and mode metadata. Node counts are already stored
+            # under node metadata and are not duplicated for deployment.
+            total_bytes += 8.0 * 3.0
+        return {
+            "node_density_scoring_model_bytes": total_bytes,
         }
 
     def _compute_atom_sharedness(self) -> Dict[int, float]:
@@ -3779,6 +3830,11 @@ class HCSOINNClassifier:
             class_score_norm_storage.get('class_score_normalization_model_bytes', 0.0)
         )
         breakdown.update(class_score_norm_storage)
+        node_density_storage = self._node_density_scoring_model_bytes()
+        node_density_scoring_model_bytes = float(
+            node_density_storage.get('node_density_scoring_model_bytes', 0.0)
+        )
+        breakdown.update(node_density_storage)
 
         if self.use_dict_coding and atom_deployable_bytes > 0.0:
             # Deployable LifeTopoDict storage keeps one atom matrix, sparse
@@ -3809,6 +3865,7 @@ class HCSOINNClassifier:
         compact += node_residual_penalty_model_bytes
         compact += raw_auxiliary_model_bytes
         compact += class_score_normalization_model_bytes
+        compact += node_density_scoring_model_bytes
         breakdown['compact_deployable_bytes'] = compact
 
         # --- Caches (inference predict cache) ---
@@ -3870,6 +3927,7 @@ class HCSOINNClassifier:
             node_residual_penalty_model_bytes +
             raw_auxiliary_model_bytes +
             class_score_normalization_model_bytes +
+            node_density_scoring_model_bytes +
             cache_bytes +
             buffers_bytes +
             frozen_bytes +
@@ -4100,6 +4158,7 @@ class HCSOINNClassifier:
         proto_class_index: List[int] = []  # index in valid_classes per proto (0..C-1)
         proto_node_index: List[int] = []   # local node index inside class; -1 for NCM fallback
         proto_residual: List[float] = []   # dictionary reconstruction residual per proto
+        proto_count: List[float] = []      # train support count per proto
         proto_lookup: Dict[Tuple[int, int], int] = {}
         cache_total_nodes = 0
         cache_inactive_nodes_filtered = 0
@@ -4134,6 +4193,9 @@ class HCSOINNClassifier:
                             proto_residual.extend([
                                 float(getattr(c, "residual", 0.0)) for c in active_clusters
                             ])
+                            proto_count.extend([
+                                float(max(1.0, getattr(c, "count", 1.0))) for c in active_clusters
+                            ])
                             for offset, node_idx in enumerate(active_node_indices):
                                 proto_lookup[(int(cls), int(node_idx))] = start_pos + offset
                             continue
@@ -4148,6 +4210,9 @@ class HCSOINNClassifier:
                         proto_residual.extend([
                             float(getattr(c, "residual", 0.0)) for c in clusters
                         ])
+                        proto_count.extend([
+                            float(max(1.0, getattr(c, "count", 1.0))) for c in clusters
+                        ])
                         for node_idx in range(len(clusters)):
                             proto_lookup[(int(cls), int(node_idx))] = start_pos + node_idx
                         continue
@@ -4159,13 +4224,23 @@ class HCSOINNClassifier:
             proto_class_index.append(int(class_index))
             proto_node_index.append(-1)
             proto_residual.append(0.0)
+            proto_count.append(1.0)
 
         all_protos_np = np.concatenate(all_protos, axis=0).astype(np.float32, copy=False)
         all_protos_t = torch.from_numpy(all_protos_np).to(device=device, dtype=torch.float32)
+        proto_count_np = np.asarray(proto_count, dtype=np.float32)
+        proto_class_index_np = np.asarray(proto_class_index, dtype=np.int64)
+        class_mean_count_np = np.ones_like(proto_count_np, dtype=np.float32)
+        for ci in range(len(valid_classes)):
+            mask = proto_class_index_np == ci
+            if np.any(mask):
+                class_mean_count_np[mask] = float(np.mean(proto_count_np[mask]))
         proto_labels_t = torch.tensor(proto_labels, device=device, dtype=torch.long)
         proto_class_index_t = torch.tensor(proto_class_index, device=device, dtype=torch.long)
         proto_node_index_t = torch.tensor(proto_node_index, device=device, dtype=torch.long)
         proto_residual_t = torch.tensor(proto_residual, device=device, dtype=torch.float32)
+        proto_count_t = torch.from_numpy(proto_count_np).to(device=device, dtype=torch.float32)
+        proto_class_mean_count_t = torch.from_numpy(class_mean_count_np).to(device=device, dtype=torch.float32)
 
         # Prototypes and NCM centers are expected to already be L2-normalized.
         # We keep them as-is to avoid extra normalize() cost per call.
@@ -4179,6 +4254,8 @@ class HCSOINNClassifier:
             "proto_class_index_t": proto_class_index_t,   # [M] in 0..C-1
             "proto_node_index_t": proto_node_index_t,     # [M] local node index or -1
             "proto_residual_t": proto_residual_t,         # [M] dictionary residual
+            "proto_count_t": proto_count_t,               # [M] train support count
+            "proto_class_mean_count_t": proto_class_mean_count_t,  # [M] class mean support
             "proto_lookup": proto_lookup,
         }
         self._last_predict_cache_filter_stats = {
@@ -5185,6 +5262,17 @@ class HCSOINNClassifier:
         if not isinstance(proto_residual_t, torch.Tensor):
             proto_residual_t = torch.zeros(all_protos_t.shape[0], device=device, dtype=torch.float32)
         proto_residual_penalty_t = self._node_residual_penalty_values(proto_residual_t, device)
+        proto_count_t = self._predict_cache.get("proto_count_t")
+        proto_class_mean_count_t = self._predict_cache.get("proto_class_mean_count_t")
+        if not isinstance(proto_count_t, torch.Tensor):
+            proto_count_t = torch.ones(all_protos_t.shape[0], device=device, dtype=torch.float32)
+        if not isinstance(proto_class_mean_count_t, torch.Tensor):
+            proto_class_mean_count_t = torch.ones(all_protos_t.shape[0], device=device, dtype=torch.float32)
+        proto_density_adjustment_t = self._node_density_adjustment_values(
+            proto_count_t,
+            proto_class_mean_count_t,
+            device,
+        )
 
         C = len(valid_classes)
         N = query_t.shape[0]
@@ -5211,10 +5299,15 @@ class HCSOINNClassifier:
             filtered_protos = all_protos_t[filtered_indices]               # [M', D]
             filtered_class_index = proto_class_index_t[filtered_indices]   # [M']
             filtered_residual_penalty = proto_residual_penalty_t[filtered_indices]
+            filtered_density_adjustment = proto_density_adjustment_t[filtered_indices]
 
             dist_filtered = 1.0 - torch.mm(q_norm, filtered_protos.t())    # [N, M']
             if filtered_residual_penalty.numel() > 0:
                 dist_filtered = dist_filtered + filtered_residual_penalty.view(1, -1).to(
+                    device=device, dtype=dist_filtered.dtype
+                )
+            if filtered_density_adjustment.numel() > 0:
+                dist_filtered = dist_filtered + filtered_density_adjustment.view(1, -1).to(
                     device=device, dtype=dist_filtered.dtype
                 )
 
@@ -5238,6 +5331,10 @@ class HCSOINNClassifier:
             dist_proto_all = compute_distance(all_protos_t, proto_labels_t)  # [N, M]
             if proto_residual_penalty_t.numel() > 0:
                 dist_proto_all = dist_proto_all + proto_residual_penalty_t.view(1, -1).to(
+                    device=device, dtype=dist_proto_all.dtype
+                )
+            if proto_density_adjustment_t.numel() > 0:
+                dist_proto_all = dist_proto_all + proto_density_adjustment_t.view(1, -1).to(
                     device=device, dtype=dist_proto_all.dtype
                 )
 
@@ -5348,6 +5445,10 @@ class HCSOINNClassifier:
                 dist_proto_all = compute_distance(all_protos_t, proto_labels_t)
                 if proto_residual_penalty_t.numel() > 0:
                     dist_proto_all = dist_proto_all + proto_residual_penalty_t.view(1, -1).to(
+                        device=device, dtype=dist_proto_all.dtype
+                    )
+                if proto_density_adjustment_t.numel() > 0:
+                    dist_proto_all = dist_proto_all + proto_density_adjustment_t.view(1, -1).to(
                         device=device, dtype=dist_proto_all.dtype
                     )
                 if stage_trace_t0 is not None:
@@ -6112,10 +6213,25 @@ class HCSOINNClassifier:
         all_protos_t = self._predict_cache["all_protos_t"]        # [M, D]
         proto_labels_t = self._predict_cache["proto_labels_t"]    # [M]
         proto_class_index_t = self._predict_cache["proto_class_index_t"]  # [M]
+        proto_count_t = self._predict_cache.get("proto_count_t")
+        proto_class_mean_count_t = self._predict_cache.get("proto_class_mean_count_t")
+        if not isinstance(proto_count_t, torch.Tensor):
+            proto_count_t = torch.ones(all_protos_t.shape[0], device=device, dtype=torch.float32)
+        if not isinstance(proto_class_mean_count_t, torch.Tensor):
+            proto_class_mean_count_t = torch.ones(all_protos_t.shape[0], device=device, dtype=torch.float32)
 
         # Distances in cosine space.
         dist_ncm = 1.0 - torch.mm(q_norm, ncm_centers_t.t())      # [N, C]
         dist_proto_all = 1.0 - torch.mm(q_norm, all_protos_t.t()) # [N, M]
+        proto_density_adjustment_t = self._node_density_adjustment_values(
+            proto_count_t,
+            proto_class_mean_count_t,
+            device,
+        )
+        if proto_density_adjustment_t.numel() > 0:
+            dist_proto_all = dist_proto_all + proto_density_adjustment_t.view(1, -1).to(
+                device=device, dtype=dist_proto_all.dtype
+            )
 
         C = len(valid_classes)
         N = query_t.shape[0]

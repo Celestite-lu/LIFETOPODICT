@@ -126,6 +126,10 @@ class Learner(BaseLearner):
         class_score_norm_mode = args.get("class_score_norm_mode", "affine")
         class_score_norm_strength = args.get("class_score_norm_strength", 1.0)
         class_score_norm_min_scale = args.get("class_score_norm_min_scale", 0.01)
+        use_node_density_scoring = args.get("use_node_density_scoring", False)
+        node_density_scoring_strength = args.get("node_density_scoring_strength", 0.0)
+        node_density_scoring_mode = args.get("node_density_scoring_mode", "log_count")
+        node_density_scoring_clip = args.get("node_density_scoring_clip", 2.0)
 
         # --- Ablation switches. Growth and additive edge-aware scoring are
         # kept for historical reproducibility only; future experiments keep
@@ -218,6 +222,10 @@ class Learner(BaseLearner):
             class_score_norm_mode=class_score_norm_mode,
             class_score_norm_strength=class_score_norm_strength,
             class_score_norm_min_scale=class_score_norm_min_scale,
+            use_node_density_scoring=use_node_density_scoring,
+            node_density_scoring_strength=node_density_scoring_strength,
+            node_density_scoring_mode=node_density_scoring_mode,
+            node_density_scoring_clip=node_density_scoring_clip,
         )
 
         # --- P0-4: Apply ablation switches (override defaults from HCSOINNClassifier) ---
@@ -310,6 +318,10 @@ class Learner(BaseLearner):
             f"class_score_norm_mode={class_score_norm_mode}, "
             f"class_score_norm_strength={class_score_norm_strength}, "
             f"class_score_norm_min_scale={class_score_norm_min_scale}, "
+            f"use_node_density_scoring={use_node_density_scoring}, "
+            f"node_density_scoring_strength={node_density_scoring_strength}, "
+            f"node_density_scoring_mode={node_density_scoring_mode}, "
+            f"node_density_scoring_clip={node_density_scoring_clip}, "
             f"enable_prediction_trace={enable_prediction_trace}, "
             f"trace_split={trace_split}, "
             f"prediction_trace_output_dir={self._prediction_trace_output_dir}, "
@@ -352,6 +364,7 @@ class Learner(BaseLearner):
             f"residual_penalty={mem.get('node_residual_penalty_model_mb', 0):.4f} MB, "
             f"raw_aux={mem.get('raw_auxiliary_model_mb', 0):.4f} MB, "
             f"class_score_norm={mem.get('class_score_normalization_model_mb', 0):.4f} MB, "
+            f"node_density={mem.get('node_density_scoring_model_mb', 0):.4f} MB, "
             f"caches={mem.get('caches_mb', 0):.4f} MB, "
             f"buffers={mem.get('buffers_mb', 0):.4f} MB, "
             f"frozen={mem.get('frozen_mb', 0):.4f} MB"
