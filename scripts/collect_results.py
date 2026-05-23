@@ -92,6 +92,12 @@ _RE_RAW_FALLBACK_LINE = re.compile(
 _RE_RAW_FALLBACK_VALUE = re.compile(
     r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
 )
+_RE_RAW_AUXILIARY_LINE = re.compile(
+    r'\[LifeTopoDict\] Raw auxiliary:'
+)
+_RE_RAW_AUXILIARY_VALUE = re.compile(
+    r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
+)
 _RE_RAW_FALLBACK_GATE_FIT_LINE = re.compile(
     r'\[LifeTopoDict\] Raw fallback gate fit:'
 )
@@ -348,6 +354,14 @@ def _parse_log_block(log_path: str, content: str, block_index: int) -> Dict[str,
             if parsed is not None:
                 result[f'raw_fallback_{key}'] = parsed
 
+    raw_aux_pos = content.rfind('[LifeTopoDict] Raw auxiliary:')
+    if raw_aux_pos >= 0:
+        raw_aux_line = content[raw_aux_pos:].splitlines()[0]
+        for key, value in _RE_RAW_AUXILIARY_VALUE.findall(raw_aux_line):
+            parsed = _safe_float(value)
+            if parsed is not None:
+                result[f'raw_auxiliary_{key}'] = parsed
+
     gate_fit_pos = content.rfind('[LifeTopoDict] Raw fallback gate fit:')
     if gate_fit_pos >= 0:
         gate_fit_line = content[gate_fit_pos:].splitlines()[0]
@@ -465,9 +479,14 @@ def write_csv(
         'memory_edges_mb', 'memory_edge_rel_mb', 'memory_edge_reliability_mb',
         'memory_caches_mb', 'memory_buffers_mb', 'memory_frozen_mb',
         'memory_fallback_mb', 'memory_fallback_gate_mb',
-        'memory_residual_penalty_mb',
+        'memory_residual_penalty_mb', 'memory_raw_aux_mb',
         'edge_use_rate', 'edge_class_use_rate', 'edge_margin_contribution',
         'edge_risk_penalty', 'edge_score_adjustment',
+        'raw_auxiliary_enabled', 'raw_auxiliary_penalty',
+        'raw_auxiliary_cache_nodes', 'raw_auxiliary_cache_classes',
+        'raw_auxiliary_available', 'raw_auxiliary_change',
+        'raw_auxiliary_compact_acc', 'raw_auxiliary_final_acc',
+        'raw_auxiliary_benefit', 'raw_auxiliary_harm', 'raw_auxiliary_net',
         'raw_fallback_rate', 'raw_fallback_compact_acc',
         'raw_fallback_fallback_acc', 'raw_fallback_final_acc',
         'raw_fallback_oracle_improvable',

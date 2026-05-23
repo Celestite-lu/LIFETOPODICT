@@ -408,6 +408,8 @@ class HCSOINNClassifier:
         fallback_pair_table_smoothing: float = 10.0,
         fallback_pair_table_lambda: float = 0.5,
         fallback_node_table_lambda: float = 0.5,
+        use_raw_auxiliary_nodes: bool = False,
+        raw_auxiliary_penalty: float = 0.0,
         enable_prediction_trace: bool = False,
         trace_split: str = "test",
         fallback_random_seed: int = 0,
@@ -548,6 +550,8 @@ class HCSOINNClassifier:
         self.fallback_pair_table_smoothing: float = max(0.0, float(fallback_pair_table_smoothing))
         self.fallback_pair_table_lambda: float = float(fallback_pair_table_lambda)
         self.fallback_node_table_lambda: float = float(fallback_node_table_lambda)
+        self.use_raw_auxiliary_nodes: bool = bool(use_raw_auxiliary_nodes)
+        self.raw_auxiliary_penalty: float = max(0.0, float(raw_auxiliary_penalty))
         self.enable_prediction_trace: bool = bool(enable_prediction_trace)
         self.trace_split: str = str(trace_split)
         self._raw_fallback_rng = np.random.RandomState(int(fallback_random_seed))
@@ -562,6 +566,8 @@ class HCSOINNClassifier:
         self._last_fallback_stats: Dict[str, float] = {}
         self._raw_fallback_eval_stats: Dict[str, float] = {}
         self.reset_raw_fallback_eval_stats(clear_trace=True)
+        self._raw_auxiliary_eval_stats: Dict[str, float] = {}
+        self.reset_raw_auxiliary_eval_stats()
 
         # ------------------------------------------------------------------ #
         # Direction 2: ATD-aware shared-atom conflict gate.
@@ -745,6 +751,18 @@ class HCSOINNClassifier:
         self._last_fallback_stats = self._summarize_raw_fallback_eval_stats()
         if clear_trace:
             self._prediction_trace_records = []
+
+    def reset_raw_auxiliary_eval_stats(self) -> None:
+        """Reset per-evaluation raw-auxiliary readout accumulators."""
+        self._raw_auxiliary_eval_stats = {
+            "samples": 0.0,
+            "aux_available": 0.0,
+            "prediction_changed": 0.0,
+            "compact_correct": 0.0,
+            "final_correct": 0.0,
+            "benefit_selected": 0.0,
+            "harm_selected": 0.0,
+        }
 
     def reset_atom_conflict_eval_stats(self) -> None:
         """Reset per-evaluation atom conflict gate accumulators."""
@@ -1005,6 +1023,15 @@ class HCSOINNClassifier:
             total_bytes += 8.0
         return {
             "node_residual_penalty_model_bytes": total_bytes,
+        }
+
+    def _raw_auxiliary_model_bytes(self) -> Dict[str, float]:
+        """Return storage bytes for raw-auxiliary readout scalars."""
+        total_bytes = 0.0
+        if bool(getattr(self, "use_raw_auxiliary_nodes", False)):
+            total_bytes += 8.0
+        return {
+            "raw_auxiliary_model_bytes": total_bytes,
         }
 
     def _compute_atom_sharedness(self) -> Dict[int, float]:
@@ -2645,6 +2672,37 @@ class HCSOINNClassifier:
         }
         return out
 
+    def _summarize_raw_auxiliary_eval_stats(self) -> Dict[str, float]:
+        stats = getattr(self, "_raw_auxiliary_eval_stats", {})
+        samples = float(stats.get("samples", 0.0))
+        nodes, classes = self._fallback_cache_counts()
+        benefit = float(stats.get("benefit_selected", 0.0))
+        harm = float(stats.get("harm_selected", 0.0))
+        out = {
+            "raw_auxiliary_enabled": float(bool(getattr(self, "use_raw_auxiliary_nodes", False))),
+            "raw_auxiliary_penalty": float(getattr(self, "raw_auxiliary_penalty", 0.0)),
+            "raw_auxiliary_cache_nodes": float(nodes),
+            "raw_auxiliary_cache_classes": float(classes),
+            "raw_auxiliary_samples": samples,
+            "raw_auxiliary_available_rate": (
+                float(stats.get("aux_available", 0.0)) / samples if samples > 0 else 0.0
+            ),
+            "raw_auxiliary_prediction_change_rate": (
+                float(stats.get("prediction_changed", 0.0)) / samples if samples > 0 else 0.0
+            ),
+            "raw_auxiliary_compact_accuracy": (
+                float(stats.get("compact_correct", 0.0)) / samples if samples > 0 else 0.0
+            ),
+            "raw_auxiliary_final_accuracy": (
+                float(stats.get("final_correct", 0.0)) / samples if samples > 0 else 0.0
+            ),
+            "raw_auxiliary_benefit_selected": benefit,
+            "raw_auxiliary_harm_selected": harm,
+            "raw_auxiliary_net_gain_count": benefit - harm,
+            "raw_auxiliary_net_gain_rate": (benefit - harm) / samples if samples > 0 else 0.0,
+        }
+        return out
+
     # ================================================================== #
     # LifeTopoDict: Dictionary initialisation, coding, materialisation   #
     # ================================================================== #
@@ -2897,7 +2955,11 @@ class HCSOINNClassifier:
         frozen_skipped = 0
         raw_fallback_candidates: List[Dict[str, object]] = []
         capture_raw_fallback = bool(
-            (getattr(self, 'use_raw_fallback_gate', False) or getattr(self, 'enable_prediction_trace', False))
+            (
+                getattr(self, 'use_raw_fallback_gate', False)
+                or getattr(self, 'use_raw_auxiliary_nodes', False)
+                or getattr(self, 'enable_prediction_trace', False)
+            )
             and getattr(self, 'raw_fallback_per_class', 0) > 0
         )
         source_task = -1
@@ -3477,6 +3539,11 @@ class HCSOINNClassifier:
             residual_penalty_storage.get('node_residual_penalty_model_bytes', 0.0)
         )
         breakdown.update(residual_penalty_storage)
+        raw_auxiliary_storage = self._raw_auxiliary_model_bytes()
+        raw_auxiliary_model_bytes = float(
+            raw_auxiliary_storage.get('raw_auxiliary_model_bytes', 0.0)
+        )
+        breakdown.update(raw_auxiliary_storage)
 
         if self.use_dict_coding and atom_deployable_bytes > 0.0:
             # Deployable LifeTopoDict storage keeps one atom matrix, sparse
@@ -3505,6 +3572,7 @@ class HCSOINNClassifier:
         compact += atom_conflict_gate_model_bytes
         compact += score_bias_model_bytes
         compact += node_residual_penalty_model_bytes
+        compact += raw_auxiliary_model_bytes
         breakdown['compact_deployable_bytes'] = compact
 
         # --- Caches (inference predict cache) ---
@@ -3564,6 +3632,7 @@ class HCSOINNClassifier:
             atom_conflict_gate_model_bytes +
             score_bias_model_bytes +
             node_residual_penalty_model_bytes +
+            raw_auxiliary_model_bytes +
             cache_bytes +
             buffers_bytes +
             frozen_bytes +
@@ -3629,6 +3698,7 @@ class HCSOINNClassifier:
         lifecycle_summary = dict(getattr(self, '_last_lifecycle_summary', {}))
         predict_cache_filter_stats = dict(getattr(self, '_last_predict_cache_filter_stats', {}))
         fallback_stats = self._summarize_raw_fallback_eval_stats()
+        raw_auxiliary_stats = self._summarize_raw_auxiliary_eval_stats()
         fallback_gate_stats = dict(getattr(self, '_raw_fallback_gate_fit_stats', {}))
         atom_gate_stats = dict(getattr(self, '_atom_conflict_gate_fit_stats', {}))
         atom_eval_stats = dict(getattr(self, '_atom_conflict_eval_stats', {}))
@@ -3667,6 +3737,7 @@ class HCSOINNClassifier:
             'predict_cache_filter_stats': predict_cache_filter_stats,
             'edge_score_stats': dict(getattr(self, '_last_edge_score_stats', {})),
             'raw_fallback_stats': fallback_stats,
+            'raw_auxiliary_stats': raw_auxiliary_stats,
             'raw_fallback_gate_stats': fallback_gate_stats,
             'atom_conflict_gate_stats': atom_gate_stats,
         }
@@ -4947,18 +5018,65 @@ class HCSOINNClassifier:
             if stage_t0 is not None:
                 self._profile_toc("compute_subcluster_distance", stage_t0, device)
         
+        raw_auxiliary_available_np = np.zeros(N, dtype=bool)
+
         # score = alpha * d_ncm + (1 - alpha) * d_sub
         stage_t0 = self._profile_tic(device) if self.enable_inference_profiling else None
         final_scores = self.alpha * dist_ncm + (1.0 - self.alpha) * dist_sub
+        edge_adjustment = None
         if getattr(self, 'use_edge_aware_scoring', False) and 'dist_proto_all' in locals():
             edge_adjustment = self._compute_edge_score_adjustment(dist_proto_all, valid_classes, device)
             final_scores = final_scores + edge_adjustment
         final_scores = self._apply_score_bias_calibration(final_scores, valid_classes, device)
+        compact_scores_for_trace = final_scores
+
+        if bool(getattr(self, "use_raw_auxiliary_nodes", False)) and getattr(self, "raw_fallback_per_class", 0) > 0:
+            self._ensure_raw_fallback_predict_cache(
+                device=device,
+                query_dim=query_dim,
+                valid_classes=valid_classes,
+            )
+            raw_cache = self._raw_fallback_predict_cache
+            aux_centers_t = raw_cache["fallback_centers_t"]
+            aux_labels_t = raw_cache["fallback_labels_t"]
+            aux_class_index_t = raw_cache["fallback_class_index_t"]
+            if aux_centers_t.shape[0] > 0:
+                stage_aux_t0 = self._profile_tic(device) if self.enable_inference_profiling else None
+                dist_aux_all = compute_distance(aux_centers_t, aux_labels_t)
+                penalty = float(getattr(self, "raw_auxiliary_penalty", 0.0))
+                if penalty > 0.0:
+                    dist_aux_all = dist_aux_all + penalty
+                dist_aux = torch.full(
+                    (N, C),
+                    float("inf"),
+                    device=device,
+                    dtype=dist_aux_all.dtype,
+                )
+                if hasattr(dist_aux, "scatter_reduce_"):
+                    idx = aux_class_index_t.view(1, -1).expand(N, -1)
+                    dist_aux.scatter_reduce_(
+                        1, idx, dist_aux_all, reduce="amin", include_self=True
+                    )
+                else:
+                    for ci in range(C):
+                        mask = (aux_class_index_t == ci)
+                        if mask.any():
+                            min_d, _ = dist_aux_all[:, mask].min(dim=1)
+                            dist_aux[:, ci] = min_d
+                raw_auxiliary_available_np = torch.isfinite(dist_aux).any(dim=1).detach().cpu().numpy()
+                dist_sub_aux = torch.minimum(dist_sub, dist_aux)
+                aux_scores = self.alpha * dist_ncm + (1.0 - self.alpha) * dist_sub_aux
+                if edge_adjustment is not None:
+                    aux_scores = aux_scores + edge_adjustment
+                final_scores = self._apply_score_bias_calibration(aux_scores, valid_classes, device)
+                if stage_aux_t0 is not None:
+                    self._profile_toc("raw_auxiliary_nodes", stage_aux_t0, device)
 
         trace_enabled = bool(
             getattr(self, 'enable_prediction_trace', False)
             or getattr(self, 'use_raw_fallback_gate', False)
             or getattr(self, 'use_atom_conflict_gate', False)
+            or getattr(self, 'use_raw_auxiliary_nodes', False)
         )
         valid_classes_np = np.array(valid_classes, dtype=np.int64)
         trace_info = None
@@ -4975,7 +5093,7 @@ class HCSOINNClassifier:
                     self._profile_toc("compute_trace_proto_distance", stage_trace_t0, device)
 
             rank_k = min(2, C)
-            compact_vals, compact_indices = torch.topk(final_scores, k=rank_k, dim=1, largest=False)
+            compact_vals, compact_indices = torch.topk(compact_scores_for_trace, k=rank_k, dim=1, largest=False)
             compact_top1_idx_t = compact_indices[:, 0]
             compact_top1_score_t = compact_vals[:, 0]
             if rank_k > 1:
@@ -4991,7 +5109,7 @@ class HCSOINNClassifier:
             compact_top2_idx_np = compact_top2_idx_t.detach().cpu().numpy()
             compact_top1_score_np = compact_top1_score_t.detach().cpu().numpy()
             compact_top2_score_np = compact_top2_score_t.detach().cpu().numpy()
-            compact_scores_np = final_scores.detach().cpu().numpy()
+            compact_scores_np = compact_scores_for_trace.detach().cpu().numpy()
             compact_margin_np = compact_margin_t.detach().cpu().numpy()
             compact_top1_labels_np = valid_classes_np[compact_top1_idx_np]
             compact_top2_labels_np = valid_classes_np[compact_top2_idx_np]
@@ -5484,6 +5602,7 @@ class HCSOINNClassifier:
                 "atom_conflict_score": atom_conflict_score_np,
                 "atom_conflict_penalty": atom_conflict_penalty_np,
                 "atom_conflict_gate": atom_conflict_gate_np,
+                "raw_auxiliary_available": raw_auxiliary_available_np,
                 "fallback_available": fallback_available_np,
                 "fallback_top1_labels": fallback_top1_labels_np,
                 "fallback_top2_labels": fallback_top2_labels_np,
@@ -5547,6 +5666,16 @@ class HCSOINNClassifier:
             atom_stats["score_sum"] += float(np.sum(trace_info.get("atom_conflict_score", np.zeros(samples))))
             atom_stats["penalty_sum"] += float(np.sum(trace_info.get("atom_conflict_penalty", np.zeros(samples))))
 
+            if bool(getattr(self, "use_raw_auxiliary_nodes", False)):
+                raw_aux_stats = self._raw_auxiliary_eval_stats
+                raw_aux_available = trace_info.get(
+                    "raw_auxiliary_available",
+                    np.zeros(samples, dtype=bool),
+                ).astype(bool)
+                raw_aux_stats["samples"] += float(samples)
+                raw_aux_stats["aux_available"] += float(np.sum(raw_aux_available))
+                raw_aux_stats["prediction_changed"] += float(np.sum(prediction_changed))
+
             if targets_np is not None and targets_np.shape[0] == samples:
                 compact_correct = compact_pred == targets_np
                 final_correct = final_pred == targets_np
@@ -5575,6 +5704,17 @@ class HCSOINNClassifier:
                 atom_stats["harm_selected"] += float(
                     np.sum(np.logical_and.reduce((atom_changed, compact_correct, ~final_correct)))
                 )
+                if bool(getattr(self, "use_raw_auxiliary_nodes", False)):
+                    raw_aux_stats = self._raw_auxiliary_eval_stats
+                    raw_aux_changed = prediction_changed
+                    raw_aux_stats["compact_correct"] += float(np.sum(compact_correct))
+                    raw_aux_stats["final_correct"] += float(np.sum(final_correct))
+                    raw_aux_stats["benefit_selected"] += float(
+                        np.sum(np.logical_and.reduce((raw_aux_changed, ~compact_correct, final_correct)))
+                    )
+                    raw_aux_stats["harm_selected"] += float(
+                        np.sum(np.logical_and.reduce((raw_aux_changed, compact_correct, ~final_correct)))
+                    )
 
             if getattr(self, "enable_prediction_trace", False):
                 boundary_for_trace = getattr(self, "known_classes_before_task", 0)
@@ -5609,6 +5749,8 @@ class HCSOINNClassifier:
                         "atom_conflict_score": float(trace_info["atom_conflict_score"][row]),
                         "atom_conflict_penalty": float(trace_info["atom_conflict_penalty"][row]),
                         "atom_conflict_used": bool(trace_info["atom_conflict_gate"][row]),
+                        "raw_auxiliary_available": bool(trace_info["raw_auxiliary_available"][row]),
+                        "raw_auxiliary_penalty": float(getattr(self, "raw_auxiliary_penalty", 0.0)),
                         "fallback_available": bool(fallback_available[row]),
                         "fallback_used": bool(fallback_gate[row]),
                         "fallback_top1": int(fallback_pred[row]),

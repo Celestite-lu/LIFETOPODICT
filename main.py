@@ -53,6 +53,7 @@ def main():
         'fallback_gate_neutral_weight', 'fallback_pair_table_mode',
         'fallback_pair_table_smoothing', 'fallback_pair_table_lambda',
         'fallback_node_table_lambda',
+        'use_raw_auxiliary_nodes', 'raw_auxiliary_penalty',
         'enable_prediction_trace', 'trace_split', 'fallback_random_seed',
         'prediction_trace_output_dir', 'prediction_trace_dump_all_tasks',
         'use_atom_conflict_gate', 'atom_conflict_metric',
@@ -210,6 +211,10 @@ def setup_parser():
                         help='Score weight for class-pair/task utility table backoff.')
     parser.add_argument('--fallback_node_table_lambda', type=float, default=None,
                         help='Score weight for selected-node/raw-class utility table.')
+    parser.add_argument('--use_raw_auxiliary_nodes', type=_str2bool, default=None,
+                        help='Use audited raw node snapshots as penalized auxiliary local HC-SOINN candidates.')
+    parser.add_argument('--raw_auxiliary_penalty', type=float, default=None,
+                        help='Additive cosine-distance penalty applied to raw auxiliary nodes.')
     parser.add_argument('--enable_prediction_trace', type=_str2bool, default=None,
                         help='Collect compact/fallback prediction trace summaries during evaluation.')
     parser.add_argument('--trace_split', type=str, default=None,

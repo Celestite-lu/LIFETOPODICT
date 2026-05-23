@@ -93,6 +93,8 @@ class Learner(BaseLearner):
         fallback_pair_table_smoothing = args.get("fallback_pair_table_smoothing", 10.0)
         fallback_pair_table_lambda = args.get("fallback_pair_table_lambda", 0.5)
         fallback_node_table_lambda = args.get("fallback_node_table_lambda", 0.5)
+        use_raw_auxiliary_nodes = args.get("use_raw_auxiliary_nodes", False)
+        raw_auxiliary_penalty = args.get("raw_auxiliary_penalty", 0.0)
         enable_prediction_trace = args.get("enable_prediction_trace", False)
         trace_split = args.get("trace_split", "test")
         use_atom_conflict_gate = args.get("use_atom_conflict_gate", False)
@@ -186,6 +188,8 @@ class Learner(BaseLearner):
             fallback_pair_table_smoothing=fallback_pair_table_smoothing,
             fallback_pair_table_lambda=fallback_pair_table_lambda,
             fallback_node_table_lambda=fallback_node_table_lambda,
+            use_raw_auxiliary_nodes=use_raw_auxiliary_nodes,
+            raw_auxiliary_penalty=raw_auxiliary_penalty,
             enable_prediction_trace=enable_prediction_trace,
             trace_split=trace_split,
             fallback_random_seed=args.get("fallback_random_seed", args.get("seed", 0)),
@@ -272,6 +276,8 @@ class Learner(BaseLearner):
             f"fallback_pair_table_smoothing={fallback_pair_table_smoothing}, "
             f"fallback_pair_table_lambda={fallback_pair_table_lambda}, "
             f"fallback_node_table_lambda={fallback_node_table_lambda}, "
+            f"use_raw_auxiliary_nodes={use_raw_auxiliary_nodes}, "
+            f"raw_auxiliary_penalty={raw_auxiliary_penalty}, "
             f"use_atom_conflict_gate={use_atom_conflict_gate}, "
             f"atom_conflict_metric={atom_conflict_metric}, "
             f"atom_conflict_target={atom_conflict_target}, "
@@ -329,6 +335,7 @@ class Learner(BaseLearner):
             f"atom_gate={mem.get('atom_conflict_gate_model_mb', 0):.4f} MB, "
             f"score_bias={mem.get('score_bias_model_mb', 0):.4f} MB, "
             f"residual_penalty={mem.get('node_residual_penalty_model_mb', 0):.4f} MB, "
+            f"raw_aux={mem.get('raw_auxiliary_model_mb', 0):.4f} MB, "
             f"caches={mem.get('caches_mb', 0):.4f} MB, "
             f"buffers={mem.get('buffers_mb', 0):.4f} MB, "
             f"frozen={mem.get('frozen_mb', 0):.4f} MB"
@@ -360,6 +367,21 @@ class Learner(BaseLearner):
                 f"residual_mean={fallback_stats.get('trace_residual_mean', 0):.4f}, "
                 f"used_margin_mean={fallback_stats.get('fallback_margin_mean', 0):.4f}, "
                 f"used_residual_mean={fallback_stats.get('fallback_residual_mean', 0):.4f}"
+            )
+        raw_auxiliary_stats = diag.get('raw_auxiliary_stats', {})
+        if raw_auxiliary_stats:
+            logging.info(
+                f"[LifeTopoDict] Raw auxiliary: enabled={int(raw_auxiliary_stats.get('raw_auxiliary_enabled', 0))}, "
+                f"penalty={raw_auxiliary_stats.get('raw_auxiliary_penalty', 0):.4f}, "
+                f"cache_nodes={int(raw_auxiliary_stats.get('raw_auxiliary_cache_nodes', 0))}, "
+                f"cache_classes={int(raw_auxiliary_stats.get('raw_auxiliary_cache_classes', 0))}, "
+                f"available={raw_auxiliary_stats.get('raw_auxiliary_available_rate', 0):.4f}, "
+                f"change={raw_auxiliary_stats.get('raw_auxiliary_prediction_change_rate', 0):.4f}, "
+                f"compact_acc={raw_auxiliary_stats.get('raw_auxiliary_compact_accuracy', 0):.4f}, "
+                f"final_acc={raw_auxiliary_stats.get('raw_auxiliary_final_accuracy', 0):.4f}, "
+                f"benefit={raw_auxiliary_stats.get('raw_auxiliary_benefit_selected', 0):.0f}, "
+                f"harm={raw_auxiliary_stats.get('raw_auxiliary_harm_selected', 0):.0f}, "
+                f"net={raw_auxiliary_stats.get('raw_auxiliary_net_gain_rate', 0):.4f}"
             )
         fallback_gate_stats = diag.get('raw_fallback_gate_stats', {})
         if fallback_gate_stats:
@@ -852,6 +874,8 @@ class Learner(BaseLearner):
         y_pred, y_true = [], []
         if hasattr(self.hc_soinn, "reset_raw_fallback_eval_stats"):
             self.hc_soinn.reset_raw_fallback_eval_stats(clear_trace=True)
+        if hasattr(self.hc_soinn, "reset_raw_auxiliary_eval_stats"):
+            self.hc_soinn.reset_raw_auxiliary_eval_stats()
         if hasattr(self.hc_soinn, "reset_atom_conflict_eval_stats"):
             self.hc_soinn.reset_atom_conflict_eval_stats()
         from_cache = is_cached_feature_loader(loader)
