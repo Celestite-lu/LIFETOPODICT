@@ -447,6 +447,11 @@ class HCSOINNClassifier:
         use_node_residual_repair: bool = False,
         node_residual_repair_per_class: int = 0,
         node_residual_repair_select_by: str = "residual",
+        # --- Class-level dictionary residual geometry repair ---
+        use_class_residual_repair: bool = False,
+        class_residual_repair_strength: float = 0.25,
+        class_residual_repair_min_nodes: int = 3,
+        class_residual_repair_mode: str = "count_weighted",
         # --- Compact score normalization ---
         use_class_score_normalization: bool = False,
         class_score_norm_mode: str = "affine",
@@ -680,6 +685,20 @@ class HCSOINNClassifier:
         self.node_residual_repair_select_by: str = str(
             node_residual_repair_select_by
         ).lower()
+
+        # ------------------------------------------------------------------ #
+        # Class residual geometry repair. Stores one train-only residual vector
+        # per class to correct systematic dictionary reconstruction distortion
+        # while retaining compressed shared-node topology as the classifier.
+        # ------------------------------------------------------------------ #
+        self.use_class_residual_repair: bool = bool(use_class_residual_repair)
+        self.class_residual_repair_strength: float = float(class_residual_repair_strength)
+        self.class_residual_repair_min_nodes: int = max(
+            1, int(class_residual_repair_min_nodes)
+        )
+        self.class_residual_repair_mode: str = str(class_residual_repair_mode).lower()
+        self.class_residual_repair_vectors: Dict[int, np.ndarray] = {}
+        self._class_residual_repair_stats: Dict[str, float] = {}
 
         # ------------------------------------------------------------------ #
         # Class-wise compact score normalization. This stores robust positive
@@ -1561,6 +1580,119 @@ class HCSOINNClassifier:
             "node_residual_repair_all_residual_mean": (
                 float(np.mean(all_residuals)) if all_residuals else 0.0
             ),
+        }
+
+    def _class_residual_repair_model_bytes(self) -> Dict[str, float]:
+        """Return deployable storage for class-level residual correction vectors."""
+        vector_bytes = 0.0
+        metadata_bytes = 0.0
+        if bool(getattr(self, "use_class_residual_repair", False)):
+            for vec in getattr(self, "class_residual_repair_vectors", {}).values():
+                if isinstance(vec, np.ndarray):
+                    vector_bytes += float(vec.nbytes)
+                    metadata_bytes += 4.0  # class id
+            # enable flag, strength, min_nodes, and mode id.
+            metadata_bytes += 8.0 * 4.0
+        total_bytes = vector_bytes + metadata_bytes
+        return {
+            "class_residual_repair_vector_bytes": vector_bytes,
+            "class_residual_repair_metadata_bytes": metadata_bytes,
+            "class_residual_repair_model_bytes": total_bytes,
+            "class_residual_repair_classes": float(
+                len(getattr(self, "class_residual_repair_vectors", {}))
+            ),
+        }
+
+    def _summarize_class_residual_repair_stats(self) -> Dict[str, float]:
+        """Summarize class residual repair vectors for diagnostics."""
+        if not bool(getattr(self, "use_class_residual_repair", False)):
+            return {}
+        vectors = getattr(self, "class_residual_repair_vectors", {}) or {}
+        norms = [
+            float(np.linalg.norm(vec))
+            for vec in vectors.values()
+            if isinstance(vec, np.ndarray)
+        ]
+        stats = dict(getattr(self, "_class_residual_repair_stats", {}) or {})
+        stats.update({
+            "enabled": 1.0,
+            "stored_classes": float(len(vectors)),
+            "strength": float(getattr(self, "class_residual_repair_strength", 0.0)),
+            "min_nodes": float(getattr(self, "class_residual_repair_min_nodes", 0)),
+            "mode": str(getattr(self, "class_residual_repair_mode", "")),
+            "vector_norm_mean": float(np.mean(norms)) if norms else 0.0,
+            "vector_norm_max": float(np.max(norms)) if norms else 0.0,
+        })
+        return stats
+
+    def _update_class_residual_repair_vectors(self, D_hat: np.ndarray) -> None:
+        """Fit class-level residual vectors from train-time raw node centers."""
+        if not bool(getattr(self, "use_class_residual_repair", False)):
+            self._class_residual_repair_stats = {}
+            return
+        if not isinstance(D_hat, np.ndarray) or D_hat.size == 0:
+            return
+
+        mode = str(getattr(self, "class_residual_repair_mode", "count_weighted")).lower()
+        min_nodes = max(1, int(getattr(self, "class_residual_repair_min_nodes", 1)))
+        updated = 0
+        candidate_nodes = 0
+        skipped_small = 0
+        for cls, clusters in self.class_clusters.items():
+            deltas: List[np.ndarray] = []
+            weights: List[float] = []
+            for node in clusters:
+                if node.node_state == 'inactive' or node.coeff is None:
+                    continue
+                if not isinstance(node.center_raw, np.ndarray):
+                    continue
+                self._ensure_coeff_width(node, D_hat.shape[0])
+                raw_center = np.asarray(node.center_raw, dtype=np.float32)
+                coeff = np.asarray(node.coeff, dtype=np.float32).reshape(-1)
+                if coeff.shape[0] != D_hat.shape[0]:
+                    continue
+                recon = coeff @ D_hat
+                if recon.shape[0] != raw_center.shape[0]:
+                    continue
+                if mode in ("unit", "unit_delta", "normalized", "direction"):
+                    delta = _normalize(raw_center) - _normalize(recon)
+                else:
+                    delta = raw_center - recon.astype(np.float32, copy=False)
+                count = max(1.0, float(getattr(node, "count", 1.0)))
+                if mode in ("count", "count_weighted"):
+                    weight = count
+                elif mode in ("residual", "residual_weighted", "residual_count"):
+                    weight = count * max(0.0, float(getattr(node, "residual", 0.0)))
+                else:
+                    weight = 1.0
+                if not np.all(np.isfinite(delta)):
+                    continue
+                deltas.append(delta.astype(np.float32, copy=False))
+                weights.append(float(max(weight, 1e-8)))
+
+            candidate_nodes += len(deltas)
+            if len(deltas) < min_nodes:
+                skipped_small += 1
+                continue
+            stacked = np.stack(deltas, axis=0)
+            weight_arr = np.asarray(weights, dtype=np.float32)
+            weight_arr = weight_arr / (float(np.sum(weight_arr)) + 1e-8)
+            vector = np.sum(stacked * weight_arr.reshape(-1, 1), axis=0).astype(np.float32)
+            if mode in ("random", "random_control"):
+                target_norm = float(np.linalg.norm(vector))
+                rng = np.random.RandomState((int(cls) * 1000003 + 17) & 0xFFFFFFFF)
+                rand_vec = rng.standard_normal(vector.shape[0]).astype(np.float32)
+                rand_norm = float(np.linalg.norm(rand_vec))
+                if rand_norm > 1e-8:
+                    vector = (rand_vec / rand_norm * target_norm).astype(np.float32)
+            self.class_residual_repair_vectors[int(cls)] = vector
+            updated += 1
+
+        self._class_residual_repair_stats = {
+            "enabled": 1.0,
+            "updated_classes": float(updated),
+            "candidate_nodes": float(candidate_nodes),
+            "skipped_small_classes": float(skipped_small),
         }
 
     def _raw_auxiliary_model_bytes(self) -> Dict[str, float]:
@@ -3724,6 +3856,7 @@ class HCSOINNClassifier:
             return
 
         D_hat = self.dict_atoms_hat  # [M, d] — single source of truth
+        self._update_class_residual_repair_vectors(D_hat)
 
         total_materialized = 0
         frozen_skipped = 0
@@ -3766,6 +3899,12 @@ class HCSOINNClassifier:
 
                 a = node.coeff.ravel()  # (M,)
                 z = a @ D_hat           # [d]  unnormalised reconstruction
+                if bool(getattr(self, "use_class_residual_repair", False)):
+                    repair_vec = getattr(self, "class_residual_repair_vectors", {}).get(int(cls))
+                    if isinstance(repair_vec, np.ndarray) and repair_vec.shape[0] == z.shape[0]:
+                        strength = float(getattr(self, "class_residual_repair_strength", 0.0))
+                        if abs(strength) > 1e-12:
+                            z = z + strength * repair_vec.astype(np.float32, copy=False)
                 repaired = False
                 if (int(cls), int(node_idx)) in repair_keys and isinstance(node.center_raw, np.ndarray):
                     raw_center = np.asarray(node.center_raw, dtype=np.float32)
@@ -4333,6 +4472,11 @@ class HCSOINNClassifier:
             residual_repair_storage.get('node_residual_repair_model_bytes', 0.0)
         )
         breakdown.update(residual_repair_storage)
+        class_residual_repair_storage = self._class_residual_repair_model_bytes()
+        class_residual_repair_model_bytes = float(
+            class_residual_repair_storage.get('class_residual_repair_model_bytes', 0.0)
+        )
+        breakdown.update(class_residual_repair_storage)
         raw_auxiliary_storage = self._raw_auxiliary_model_bytes()
         raw_auxiliary_model_bytes = float(
             raw_auxiliary_storage.get('raw_auxiliary_model_bytes', 0.0)
@@ -4383,6 +4527,7 @@ class HCSOINNClassifier:
         compact += pair_margin_model_bytes
         compact += node_residual_penalty_model_bytes
         compact += node_residual_repair_model_bytes
+        compact += class_residual_repair_model_bytes
         compact += raw_auxiliary_model_bytes
         compact += class_score_normalization_model_bytes
         compact += node_density_scoring_model_bytes
@@ -4447,6 +4592,8 @@ class HCSOINNClassifier:
             score_bias_model_bytes +
             pair_margin_model_bytes +
             node_residual_penalty_model_bytes +
+            node_residual_repair_model_bytes +
+            class_residual_repair_model_bytes +
             raw_auxiliary_model_bytes +
             class_score_normalization_model_bytes +
             node_density_scoring_model_bytes +
@@ -4527,6 +4674,7 @@ class HCSOINNClassifier:
         )
         class_score_norm_stats = dict(getattr(self, '_class_score_norm_fit_stats', {}))
         node_residual_repair_stats = self._summarize_node_residual_repair_stats()
+        class_residual_repair_stats = self._summarize_class_residual_repair_stats()
         if atom_gate_stats:
             samples_eval = float(atom_eval_stats.get('samples', 0.0))
             if samples_eval > 0.0:
@@ -4617,6 +4765,7 @@ class HCSOINNClassifier:
             'topology_reliability_stats': topology_reliability_stats,
             'class_score_normalization_stats': class_score_norm_stats,
             'node_residual_repair_stats': node_residual_repair_stats,
+            'class_residual_repair_stats': class_residual_repair_stats,
         }
 
         logging.info(

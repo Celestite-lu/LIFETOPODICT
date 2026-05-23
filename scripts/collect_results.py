@@ -128,6 +128,12 @@ _RE_TOPOLOGY_RELIABILITY_LINE = re.compile(
 _RE_TOPOLOGY_RELIABILITY_VALUE = re.compile(
     r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
 )
+_RE_CLASS_RESIDUAL_REPAIR_LINE = re.compile(
+    r'\[LifeTopoDict\] Class residual repair:'
+)
+_RE_CLASS_RESIDUAL_REPAIR_VALUE = re.compile(
+    r'([A-Za-z_]+)=([-\d.eEnaN+]+)'
+)
 _RE_CONFIG_PREFIX = re.compile(
     r'prefix:[ \t]*(.*)'
 )
@@ -414,6 +420,14 @@ def _parse_log_block(log_path: str, content: str, block_index: int) -> Dict[str,
             if parsed is not None:
                 result[f'topology_reliability_{key}'] = parsed
 
+    class_residual_repair_pos = content.rfind('[LifeTopoDict] Class residual repair:')
+    if class_residual_repair_pos >= 0:
+        class_residual_repair_line = content[class_residual_repair_pos:].splitlines()[0]
+        for key, value in _RE_CLASS_RESIDUAL_REPAIR_VALUE.findall(class_residual_repair_line):
+            parsed = _safe_float(value)
+            if parsed is not None:
+                result[f'class_residual_repair_{key}'] = parsed
+
     return result
 
 
@@ -511,6 +525,7 @@ def write_csv(
         'memory_raw_aux_mb',
         'memory_pair_margin_mb',
         'memory_topology_reliability_mb',
+        'memory_class_residual_repair_mb',
         'edge_use_rate', 'edge_class_use_rate', 'edge_margin_contribution',
         'edge_risk_penalty', 'edge_score_adjustment',
         'raw_auxiliary_enabled', 'raw_auxiliary_penalty',
@@ -543,6 +558,13 @@ def write_csv(
         'topology_reliability_eval_final_acc',
         'topology_reliability_benefit',
         'topology_reliability_harm',
+        'class_residual_repair_enabled',
+        'class_residual_repair_stored',
+        'class_residual_repair_updated',
+        'class_residual_repair_strength',
+        'class_residual_repair_min_nodes',
+        'class_residual_repair_vector_norm_mean',
+        'class_residual_repair_vector_norm_max',
     ]
 
     all_keys: List[str] = []

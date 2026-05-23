@@ -74,6 +74,8 @@ def main():
         'node_residual_penalty_mode',
         'use_node_residual_repair', 'node_residual_repair_per_class',
         'node_residual_repair_select_by',
+        'use_class_residual_repair', 'class_residual_repair_strength',
+        'class_residual_repair_min_nodes', 'class_residual_repair_mode',
         'use_class_score_normalization', 'class_score_norm_mode',
         'class_score_norm_strength', 'class_score_norm_min_scale',
         'use_node_density_scoring', 'node_density_scoring_strength',
@@ -289,6 +291,14 @@ def setup_parser():
                         help='Number of nodes per class to repair with raw centers.')
     parser.add_argument('--node_residual_repair_select_by', type=str, default=None,
                         help='Residual repair node ranking: residual, count, residual_count, low_residual, or random_control.')
+    parser.add_argument('--use_class_residual_repair', type=_str2bool, default=None,
+                        help='Apply class-level dictionary residual correction to materialized compact nodes.')
+    parser.add_argument('--class_residual_repair_strength', type=float, default=None,
+                        help='Strength gamma for class residual geometry repair.')
+    parser.add_argument('--class_residual_repair_min_nodes', type=int, default=None,
+                        help='Minimum raw nodes required to fit a class residual repair vector.')
+    parser.add_argument('--class_residual_repair_mode', type=str, default=None,
+                        help='Class residual repair mode: mean, count_weighted, residual_weighted, or random_control.')
     parser.add_argument('--use_class_score_normalization', type=_str2bool, default=None,
                         help='Normalize compact HC-SOINN scores with train-only per-class distance stats.')
     parser.add_argument('--class_score_norm_mode', type=str, default=None,

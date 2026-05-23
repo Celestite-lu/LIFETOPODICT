@@ -137,6 +137,10 @@ class Learner(BaseLearner):
         use_node_residual_repair = args.get("use_node_residual_repair", False)
         node_residual_repair_per_class = args.get("node_residual_repair_per_class", 0)
         node_residual_repair_select_by = args.get("node_residual_repair_select_by", "residual")
+        use_class_residual_repair = args.get("use_class_residual_repair", False)
+        class_residual_repair_strength = args.get("class_residual_repair_strength", 0.25)
+        class_residual_repair_min_nodes = args.get("class_residual_repair_min_nodes", 3)
+        class_residual_repair_mode = args.get("class_residual_repair_mode", "count_weighted")
         use_class_score_normalization = args.get("use_class_score_normalization", False)
         class_score_norm_mode = args.get("class_score_norm_mode", "affine")
         class_score_norm_strength = args.get("class_score_norm_strength", 1.0)
@@ -254,6 +258,10 @@ class Learner(BaseLearner):
             use_node_residual_repair=use_node_residual_repair,
             node_residual_repair_per_class=node_residual_repair_per_class,
             node_residual_repair_select_by=node_residual_repair_select_by,
+            use_class_residual_repair=use_class_residual_repair,
+            class_residual_repair_strength=class_residual_repair_strength,
+            class_residual_repair_min_nodes=class_residual_repair_min_nodes,
+            class_residual_repair_mode=class_residual_repair_mode,
             use_class_score_normalization=use_class_score_normalization,
             class_score_norm_mode=class_score_norm_mode,
             class_score_norm_strength=class_score_norm_strength,
@@ -372,6 +380,10 @@ class Learner(BaseLearner):
             f"use_node_residual_repair={use_node_residual_repair}, "
             f"node_residual_repair_per_class={node_residual_repair_per_class}, "
             f"node_residual_repair_select_by={node_residual_repair_select_by}, "
+            f"use_class_residual_repair={use_class_residual_repair}, "
+            f"class_residual_repair_strength={class_residual_repair_strength}, "
+            f"class_residual_repair_min_nodes={class_residual_repair_min_nodes}, "
+            f"class_residual_repair_mode={class_residual_repair_mode}, "
             f"use_class_score_normalization={use_class_score_normalization}, "
             f"class_score_norm_mode={class_score_norm_mode}, "
             f"class_score_norm_strength={class_score_norm_strength}, "
@@ -429,6 +441,7 @@ class Learner(BaseLearner):
             f"pair_margin={mem.get('pair_margin_model_mb', 0):.4f} MB, "
             f"residual_penalty={mem.get('node_residual_penalty_model_mb', 0):.4f} MB, "
             f"residual_repair={mem.get('node_residual_repair_model_mb', 0):.4f} MB, "
+            f"class_residual_repair={mem.get('class_residual_repair_model_mb', 0):.4f} MB, "
             f"raw_aux={mem.get('raw_auxiliary_model_mb', 0):.4f} MB, "
             f"class_score_norm={mem.get('class_score_normalization_model_mb', 0):.4f} MB, "
             f"node_density={mem.get('node_density_scoring_model_mb', 0):.4f} MB, "
@@ -544,6 +557,19 @@ class Learner(BaseLearner):
                 f"ref_center={class_score_norm_stats.get('ref_center', 0):.6f}, "
                 f"ref_scale={class_score_norm_stats.get('ref_scale', 0):.6f}, "
                 f"strength={class_score_norm_stats.get('strength', 0):.3f}"
+            )
+        class_residual_repair_stats = diag.get('class_residual_repair_stats', {})
+        if class_residual_repair_stats:
+            logging.info(
+                f"[LifeTopoDict] Class residual repair: "
+                f"enabled={int(class_residual_repair_stats.get('enabled', 0))}, "
+                f"stored={int(class_residual_repair_stats.get('stored_classes', 0))}, "
+                f"updated={int(class_residual_repair_stats.get('updated_classes', 0))}, "
+                f"mode={class_residual_repair_stats.get('mode', '')}, "
+                f"strength={class_residual_repair_stats.get('strength', 0):.4f}, "
+                f"min_nodes={int(class_residual_repair_stats.get('min_nodes', 0))}, "
+                f"vector_norm_mean={class_residual_repair_stats.get('vector_norm_mean', 0):.6f}, "
+                f"vector_norm_max={class_residual_repair_stats.get('vector_norm_max', 0):.6f}"
             )
         pair_margin_stats = diag.get('pair_margin_stats', {})
         if pair_margin_stats:
