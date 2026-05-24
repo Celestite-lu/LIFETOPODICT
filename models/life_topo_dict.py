@@ -143,6 +143,10 @@ class Learner(BaseLearner):
         train_node_risk_smoothing = args.get("train_node_risk_smoothing", 5.0)
         train_node_risk_min_visits = args.get("train_node_risk_min_visits", 2)
         train_node_risk_metric = args.get("train_node_risk_metric", "error_rate")
+        use_task_prior_scoring = args.get("use_task_prior_scoring", False)
+        task_prior_strength = args.get("task_prior_strength", 0.0)
+        task_prior_topm = args.get("task_prior_topm", 3)
+        task_prior_mode = args.get("task_prior_mode", "topm_mean")
         use_class_residual_repair = args.get("use_class_residual_repair", False)
         class_residual_repair_strength = args.get("class_residual_repair_strength", 0.25)
         class_residual_repair_min_nodes = args.get("class_residual_repair_min_nodes", 3)
@@ -270,6 +274,10 @@ class Learner(BaseLearner):
             train_node_risk_smoothing=train_node_risk_smoothing,
             train_node_risk_min_visits=train_node_risk_min_visits,
             train_node_risk_metric=train_node_risk_metric,
+            use_task_prior_scoring=use_task_prior_scoring,
+            task_prior_strength=task_prior_strength,
+            task_prior_topm=task_prior_topm,
+            task_prior_mode=task_prior_mode,
             use_class_residual_repair=use_class_residual_repair,
             class_residual_repair_strength=class_residual_repair_strength,
             class_residual_repair_min_nodes=class_residual_repair_min_nodes,
@@ -398,6 +406,10 @@ class Learner(BaseLearner):
             f"train_node_risk_smoothing={train_node_risk_smoothing}, "
             f"train_node_risk_min_visits={train_node_risk_min_visits}, "
             f"train_node_risk_metric={train_node_risk_metric}, "
+            f"use_task_prior_scoring={use_task_prior_scoring}, "
+            f"task_prior_strength={task_prior_strength}, "
+            f"task_prior_topm={task_prior_topm}, "
+            f"task_prior_mode={task_prior_mode}, "
             f"use_class_residual_repair={use_class_residual_repair}, "
             f"class_residual_repair_strength={class_residual_repair_strength}, "
             f"class_residual_repair_min_nodes={class_residual_repair_min_nodes}, "
@@ -460,6 +472,7 @@ class Learner(BaseLearner):
             f"residual_penalty={mem.get('node_residual_penalty_model_mb', 0):.4f} MB, "
             f"residual_repair={mem.get('node_residual_repair_model_mb', 0):.4f} MB, "
             f"train_node_risk={mem.get('train_node_risk_model_mb', 0):.4f} MB, "
+            f"task_prior={mem.get('task_prior_model_mb', 0):.4f} MB, "
             f"class_residual_repair={mem.get('class_residual_repair_model_mb', 0):.4f} MB, "
             f"raw_aux={mem.get('raw_auxiliary_model_mb', 0):.4f} MB, "
             f"class_score_norm={mem.get('class_score_normalization_model_mb', 0):.4f} MB, "
@@ -540,6 +553,20 @@ class Learner(BaseLearner):
                 f"mean={train_node_risk_stats.get('risk_mean', 0):.6f}, "
                 f"max={train_node_risk_stats.get('risk_max', 0):.6f}, "
                 f"disabled={int(train_node_risk_stats.get('gate_disabled', 0))}"
+            )
+        task_prior_stats = diag.get('task_prior_stats', {})
+        if task_prior_stats:
+            logging.info(
+                f"[LifeTopoDict] Task prior: "
+                f"enabled={int(task_prior_stats.get('enabled', 0))}, "
+                f"mode={task_prior_stats.get('mode', '')}, "
+                f"strength={task_prior_stats.get('strength', 0):.4f}, "
+                f"topm={int(task_prior_stats.get('topm', 0))}, "
+                f"samples={int(task_prior_stats.get('samples', 0))}, "
+                f"change={task_prior_stats.get('change_rate', 0):.4f}, "
+                f"task_margin={task_prior_stats.get('task_margin_mean', 0):.6f}, "
+                f"adjustment={task_prior_stats.get('adjustment_mean', 0):.6f}, "
+                f"max_adjustment={task_prior_stats.get('max_adjustment', 0):.6f}"
             )
         fallback_gate_stats = diag.get('raw_fallback_gate_stats', {})
         if fallback_gate_stats:
@@ -1225,6 +1252,8 @@ class Learner(BaseLearner):
             self.hc_soinn.reset_pair_margin_eval_stats()
         if hasattr(self.hc_soinn, "reset_topology_reliability_eval_stats"):
             self.hc_soinn.reset_topology_reliability_eval_stats()
+        if hasattr(self.hc_soinn, "reset_task_prior_eval_stats"):
+            self.hc_soinn.reset_task_prior_eval_stats()
         from_cache = is_cached_feature_loader(loader)
         if not from_cache and self._network is None:
             raise RuntimeError(

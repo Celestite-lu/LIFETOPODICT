@@ -454,6 +454,11 @@ class HCSOINNClassifier:
         train_node_risk_smoothing: float = 5.0,
         train_node_risk_min_visits: int = 2,
         train_node_risk_metric: str = "error_rate",
+        # --- Compact task-prior scoring ---
+        use_task_prior_scoring: bool = False,
+        task_prior_strength: float = 0.0,
+        task_prior_topm: int = 3,
+        task_prior_mode: str = "topm_mean",
         # --- Class-level dictionary residual geometry repair ---
         use_class_residual_repair: bool = False,
         class_residual_repair_strength: float = 0.25,
@@ -701,6 +706,12 @@ class HCSOINNClassifier:
         self.train_node_risk_metric: str = str(train_node_risk_metric).lower()
         self.train_node_risk_table: Dict[Tuple[int, int], float] = {}
         self._train_node_risk_fit_stats: Dict[str, object] = {}
+
+        self.use_task_prior_scoring: bool = bool(use_task_prior_scoring)
+        self.task_prior_strength: float = max(0.0, float(task_prior_strength))
+        self.task_prior_topm: int = max(1, int(task_prior_topm))
+        self.task_prior_mode: str = str(task_prior_mode).lower()
+        self._task_prior_eval_stats: Dict[str, float] = {}
 
         # ------------------------------------------------------------------ #
         # Class residual geometry repair. Stores one train-only residual vector
@@ -1223,6 +1234,16 @@ class HCSOINNClassifier:
             "harm_selected": 0.0,
         }
 
+    def reset_task_prior_eval_stats(self) -> None:
+        """Reset per-evaluation compact task-prior accumulators."""
+        self._task_prior_eval_stats = {
+            "samples": 0.0,
+            "prediction_changed": 0.0,
+            "task_margin_sum": 0.0,
+            "adjustment_sum": 0.0,
+            "max_adjustment": 0.0,
+        }
+
     def get_prediction_trace(self) -> List[Dict[str, object]]:
         """Return the most recent eval prediction trace records."""
         return list(getattr(self, "_prediction_trace_records", []))
@@ -1658,6 +1679,149 @@ class HCSOINNClassifier:
             key = (int(classes_np[int(class_pos)]), int(node_idx))
             values[i] = float(table.get(key, 0.0)) * strength
         return torch.from_numpy(values).to(device=device, dtype=torch.float32)
+
+    def _task_prior_model_bytes(self) -> Dict[str, float]:
+        """Return storage bytes for compact task-prior scoring scalars."""
+        total_bytes = 0.0
+        if bool(getattr(self, "use_task_prior_scoring", False)):
+            # strength, top-m, mode id, enable flag
+            total_bytes += 8.0 * 4.0
+        return {
+            "task_prior_model_bytes": total_bytes,
+        }
+
+    def _summarize_task_prior_stats(self) -> Dict[str, object]:
+        """Return compact task-prior scoring diagnostics."""
+        if not bool(getattr(self, "use_task_prior_scoring", False)):
+            return {}
+        stats = dict(getattr(self, "_task_prior_eval_stats", {}) or {})
+        samples = float(stats.get("samples", 0.0))
+        stats.update({
+            "enabled": 1.0,
+            "strength": float(getattr(self, "task_prior_strength", 0.0)),
+            "topm": float(getattr(self, "task_prior_topm", 1)),
+            "mode": str(getattr(self, "task_prior_mode", "")),
+            "change_rate": (
+                float(stats.get("prediction_changed", 0.0)) / samples
+                if samples > 0.0 else 0.0
+            ),
+            "task_margin_mean": (
+                float(stats.get("task_margin_sum", 0.0)) / samples
+                if samples > 0.0 else 0.0
+            ),
+            "adjustment_mean": (
+                float(stats.get("adjustment_sum", 0.0)) / samples
+                if samples > 0.0 else 0.0
+            ),
+        })
+        return stats
+
+    def _task_ids_for_classes(
+        self,
+        valid_classes: List[int],
+        init_cls: int,
+        task_increment: int,
+    ) -> np.ndarray:
+        """Map class ids to generic incremental task ids."""
+        init_cls = max(1, int(init_cls))
+        task_increment = max(1, int(task_increment))
+        task_ids: List[int] = []
+        for cls in valid_classes:
+            cls_int = int(cls)
+            if cls_int < init_cls:
+                task_ids.append(0)
+            else:
+                task_ids.append(1 + (cls_int - init_cls) // task_increment)
+        return np.asarray(task_ids, dtype=np.int64)
+
+    def _apply_task_prior_scoring(
+        self,
+        final_scores: torch.Tensor,
+        valid_classes: List[int],
+        init_cls: int,
+        task_increment: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Apply compact task-level support prior to class scores."""
+        strength = float(getattr(self, "task_prior_strength", 0.0))
+        if (
+            not bool(getattr(self, "use_task_prior_scoring", False))
+            or strength <= 1e-12
+            or final_scores.numel() == 0
+            or len(valid_classes) <= 1
+        ):
+            return final_scores
+
+        task_ids_np = self._task_ids_for_classes(valid_classes, init_cls, task_increment)
+        unique_tasks = np.unique(task_ids_np)
+        if unique_tasks.size <= 1:
+            return final_scores
+
+        mode = str(getattr(self, "task_prior_mode", "topm_mean")).lower()
+        task_scores: List[torch.Tensor] = []
+        class_task_cols: List[int] = []
+        for task_col, task_id in enumerate(unique_tasks.tolist()):
+            mask_np = task_ids_np == int(task_id)
+            class_task_cols.extend([task_col] * int(np.sum(mask_np)))
+            mask_t = torch.from_numpy(mask_np).to(device=device, dtype=torch.bool)
+            scores_t = final_scores[:, mask_t]
+            if scores_t.shape[1] == 0:
+                continue
+            if mode in ("mean", "task_mean"):
+                task_score = torch.mean(scores_t, dim=1)
+            elif mode in ("min", "task_min"):
+                task_score, _ = torch.min(scores_t, dim=1)
+            elif mode in ("random", "random_control"):
+                rng = np.random.RandomState(
+                    104729 + int(final_scores.shape[0]) + int(final_scores.shape[1]) + int(task_id)
+                )
+                random_values = rng.rand(final_scores.shape[0]).astype(np.float32)
+                task_score = torch.from_numpy(random_values).to(
+                    device=device, dtype=final_scores.dtype
+                )
+            else:
+                topm = min(int(getattr(self, "task_prior_topm", 3)), int(scores_t.shape[1]))
+                vals, _ = torch.topk(scores_t, k=topm, dim=1, largest=False)
+                task_score = torch.mean(vals, dim=1)
+            task_scores.append(task_score)
+
+        if len(task_scores) <= 1:
+            return final_scores
+
+        task_score_t = torch.stack(task_scores, dim=1)
+        best_task_score_t, _ = torch.min(task_score_t, dim=1)
+        task_penalty_t = task_score_t - best_task_score_t.view(-1, 1)
+
+        class_task_cols_np = np.zeros(len(valid_classes), dtype=np.int64)
+        for col, task_id in enumerate(unique_tasks.tolist()):
+            class_task_cols_np[task_ids_np == int(task_id)] = int(col)
+        class_task_cols_t = torch.from_numpy(class_task_cols_np).to(device=device, dtype=torch.long)
+        class_adjust_t = task_penalty_t[:, class_task_cols_t]
+        adjusted_scores = final_scores + strength * class_adjust_t
+
+        try:
+            before = torch.argmin(final_scores, dim=1)
+            after = torch.argmin(adjusted_scores, dim=1)
+            changed = torch.sum(before != after).detach().cpu().item()
+            if task_score_t.shape[1] >= 2:
+                sorted_task_scores, _ = torch.topk(task_score_t, k=2, dim=1, largest=False)
+                task_margin = sorted_task_scores[:, 1] - sorted_task_scores[:, 0]
+                margin_sum = float(torch.sum(task_margin).detach().cpu().item())
+            else:
+                margin_sum = 0.0
+            max_adjust = float(torch.max(strength * class_adjust_t).detach().cpu().item())
+            mean_adjust_sum = float(torch.mean(strength * class_adjust_t, dim=1).sum().detach().cpu().item())
+            stats = getattr(self, "_task_prior_eval_stats", {})
+            stats["samples"] = float(stats.get("samples", 0.0)) + float(final_scores.shape[0])
+            stats["prediction_changed"] = float(stats.get("prediction_changed", 0.0)) + float(changed)
+            stats["task_margin_sum"] = float(stats.get("task_margin_sum", 0.0)) + margin_sum
+            stats["adjustment_sum"] = float(stats.get("adjustment_sum", 0.0)) + mean_adjust_sum
+            stats["max_adjustment"] = max(float(stats.get("max_adjustment", 0.0)), max_adjust)
+            self._task_prior_eval_stats = stats
+        except Exception:
+            pass
+
+        return adjusted_scores
 
     def fit_train_node_risk_penalty(
         self,
@@ -4675,6 +4839,11 @@ class HCSOINNClassifier:
             train_node_risk_storage.get('train_node_risk_model_bytes', 0.0)
         )
         breakdown.update(train_node_risk_storage)
+        task_prior_storage = self._task_prior_model_bytes()
+        task_prior_model_bytes = float(
+            task_prior_storage.get('task_prior_model_bytes', 0.0)
+        )
+        breakdown.update(task_prior_storage)
         residual_penalty_storage = self._node_residual_penalty_model_bytes()
         node_residual_penalty_model_bytes = float(
             residual_penalty_storage.get('node_residual_penalty_model_bytes', 0.0)
@@ -4739,6 +4908,7 @@ class HCSOINNClassifier:
         compact += score_bias_model_bytes
         compact += pair_margin_model_bytes
         compact += train_node_risk_model_bytes
+        compact += task_prior_model_bytes
         compact += node_residual_penalty_model_bytes
         compact += node_residual_repair_model_bytes
         compact += class_residual_repair_model_bytes
@@ -4806,6 +4976,7 @@ class HCSOINNClassifier:
             score_bias_model_bytes +
             pair_margin_model_bytes +
             train_node_risk_model_bytes +
+            task_prior_model_bytes +
             node_residual_penalty_model_bytes +
             node_residual_repair_model_bytes +
             class_residual_repair_model_bytes +
@@ -4890,6 +5061,7 @@ class HCSOINNClassifier:
         class_score_norm_stats = dict(getattr(self, '_class_score_norm_fit_stats', {}))
         node_residual_repair_stats = self._summarize_node_residual_repair_stats()
         train_node_risk_stats = self._summarize_train_node_risk_stats()
+        task_prior_stats = self._summarize_task_prior_stats()
         class_residual_repair_stats = self._summarize_class_residual_repair_stats()
         if atom_gate_stats:
             samples_eval = float(atom_eval_stats.get('samples', 0.0))
@@ -4982,6 +5154,7 @@ class HCSOINNClassifier:
             'class_score_normalization_stats': class_score_norm_stats,
             'node_residual_repair_stats': node_residual_repair_stats,
             'train_node_risk_stats': train_node_risk_stats,
+            'task_prior_stats': task_prior_stats,
             'class_residual_repair_stats': class_residual_repair_stats,
         }
 
@@ -6333,6 +6506,13 @@ class HCSOINNClassifier:
             final_scores = final_scores + edge_adjustment
         final_scores = self._apply_score_bias_calibration(final_scores, valid_classes, device)
         final_scores = self._apply_class_score_normalization(final_scores, valid_classes, device)
+        final_scores = self._apply_task_prior_scoring(
+            final_scores,
+            valid_classes,
+            init_cls,
+            task_increment,
+            device,
+        )
         compact_scores_for_trace = final_scores
 
         if bool(getattr(self, "use_raw_auxiliary_nodes", False)) and getattr(self, "raw_fallback_per_class", 0) > 0:
@@ -6395,6 +6575,13 @@ class HCSOINNClassifier:
                     aux_scores = aux_scores + edge_adjustment
                 final_scores = self._apply_score_bias_calibration(aux_scores, valid_classes, device)
                 final_scores = self._apply_class_score_normalization(final_scores, valid_classes, device)
+                final_scores = self._apply_task_prior_scoring(
+                    final_scores,
+                    valid_classes,
+                    init_cls,
+                    task_increment,
+                    device,
+                )
                 if stage_aux_t0 is not None:
                     self._profile_toc("raw_auxiliary_nodes", stage_aux_t0, device)
 

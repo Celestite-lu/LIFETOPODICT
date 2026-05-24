@@ -140,6 +140,12 @@ _RE_TRAIN_NODE_RISK_LINE = re.compile(
 _RE_TRAIN_NODE_RISK_VALUE = re.compile(
     r'([A-Za-z_]+)=([A-Za-z_]+|[-\d.eEnaN+]+)'
 )
+_RE_TASK_PRIOR_LINE = re.compile(
+    r'\[LifeTopoDict\] Task prior:'
+)
+_RE_TASK_PRIOR_VALUE = re.compile(
+    r'([A-Za-z_]+)=([A-Za-z_]+|[-\d.eEnaN+]+)'
+)
 _RE_CONFIG_PREFIX = re.compile(
     r'prefix:[ \t]*(.*)'
 )
@@ -444,6 +450,16 @@ def _parse_log_block(log_path: str, content: str, block_index: int) -> Dict[str,
             elif key == 'metric':
                 result['train_node_risk_metric'] = value
 
+    task_prior_pos = content.rfind('[LifeTopoDict] Task prior:')
+    if task_prior_pos >= 0:
+        task_prior_line = content[task_prior_pos:].splitlines()[0]
+        for key, value in _RE_TASK_PRIOR_VALUE.findall(task_prior_line):
+            parsed = _safe_float(value)
+            if parsed is not None:
+                result[f'task_prior_{key}'] = parsed
+            elif key == 'mode':
+                result['task_prior_mode'] = value
+
     return result
 
 
@@ -539,6 +555,7 @@ def write_csv(
         'memory_fallback_mb', 'memory_fallback_gate_mb',
         'memory_residual_penalty_mb', 'memory_residual_repair_mb',
         'memory_train_node_risk_mb',
+        'memory_task_prior_mb',
         'memory_raw_aux_mb',
         'memory_pair_margin_mb',
         'memory_topology_reliability_mb',
@@ -593,6 +610,15 @@ def write_csv(
         'train_node_risk_mean',
         'train_node_risk_max',
         'train_node_risk_disabled',
+        'task_prior_enabled',
+        'task_prior_mode',
+        'task_prior_strength',
+        'task_prior_topm',
+        'task_prior_samples',
+        'task_prior_change',
+        'task_prior_task_margin',
+        'task_prior_adjustment',
+        'task_prior_max_adjustment',
     ]
 
     all_keys: List[str] = []

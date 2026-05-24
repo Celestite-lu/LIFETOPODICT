@@ -77,6 +77,8 @@ def main():
         'use_train_node_risk_penalty', 'train_node_risk_strength',
         'train_node_risk_topk', 'train_node_risk_smoothing',
         'train_node_risk_min_visits', 'train_node_risk_metric',
+        'use_task_prior_scoring', 'task_prior_strength',
+        'task_prior_topm', 'task_prior_mode',
         'use_class_residual_repair', 'class_residual_repair_strength',
         'class_residual_repair_min_nodes', 'class_residual_repair_mode',
         'use_class_score_normalization', 'class_score_norm_mode',
@@ -306,6 +308,14 @@ def setup_parser():
                         help='Minimum train winner visits required for a node-risk entry.')
     parser.add_argument('--train_node_risk_metric', type=str, default=None,
                         help='Node risk ranking: error_rate, pmi, random_control, or high_count.')
+    parser.add_argument('--use_task_prior_scoring', type=_str2bool, default=None,
+                        help='Enable compact task-prior score adjustment.')
+    parser.add_argument('--task_prior_strength', type=float, default=None,
+                        help='Strength for compact task-prior penalty.')
+    parser.add_argument('--task_prior_topm', type=int, default=None,
+                        help='Number of best class scores per task used to estimate task support.')
+    parser.add_argument('--task_prior_mode', type=str, default=None,
+                        help='Task-prior mode: topm_mean, mean, min, or random_control.')
     parser.add_argument('--use_class_residual_repair', type=_str2bool, default=None,
                         help='Apply class-level dictionary residual correction to materialized compact nodes.')
     parser.add_argument('--class_residual_repair_strength', type=float, default=None,
